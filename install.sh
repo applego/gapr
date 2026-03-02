@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 #
-# APR (Automated Plan Reviser Pro) Installer
-# Downloads and installs APR to your system with checksum verification
+# gapr (Gemini Automated Plan Reviser) Installer
+# Installs gapr and gemini-helper.sh to your system
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/automated_plan_reviser_pro/main/install.sh | bash
+#   cd gapr && bash install.sh
 #
 # Options (via environment variables):
 #   DEST=/path/to/dir      Install directory (default: ~/.local/bin)
 #   APR_SYSTEM=1           Install to /usr/local/bin (requires sudo)
-#   APR_NO_DEPS=1          Skip dependency installation
-#   APR_VERSION=x.y.z      Install specific version (default: latest from main)
-#   APR_SKIP_VERIFY=1      Skip checksum verification (not recommended)
 #   NO_COLOR=1             Disable colored output
 #
 # Exit Codes:
@@ -36,8 +33,9 @@ readonly REPO_OWNER="Dicklesworthstone"
 readonly REPO_NAME="automated_plan_reviser_pro"
 readonly REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
 readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-readonly SCRIPT_NAME="apr"
-readonly INSTALLER_VERSION="1.1.0"
+readonly SCRIPT_NAME="gapr"
+readonly HELPER_NAME="gemini-helper.sh"
+readonly INSTALLER_VERSION="2.0.0"
 
 # Colors (conditional on TTY and NO_COLOR)
 if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -488,54 +486,68 @@ main() {
         log_warn "Skipping checksum verification (APR_SKIP_VERIFY=1)"
     fi
 
-    # Install APR
+    # Install gapr
     log_step "Installing to ${script_path}..."
     $use_sudo mv "$tmp_file" "$script_path"
     $use_sudo chmod +x "$script_path"
 
+    # Also install gemini-helper.sh alongside gapr
+    local helper_path="${install_dir}/${HELPER_NAME}"
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${script_dir}/${HELPER_NAME}" ]]; then
+        log_step "Installing ${HELPER_NAME} to ${helper_path}..."
+        $use_sudo cp "${script_dir}/${HELPER_NAME}" "$helper_path"
+        $use_sudo chmod +x "$helper_path"
+    fi
+
     # Add to PATH
     add_to_path "$install_dir" "$shell_config"
 
-    # Install dependencies (unless disabled)
-    local gum_ok=false oracle_ok=false
+    # Check dependencies
+    local gum_ok=false curl_ok=false jq_ok=false
+    command -v gum &>/dev/null && gum_ok=true
+    command -v curl &>/dev/null && curl_ok=true
+    command -v jq &>/dev/null && jq_ok=true
+
+    # Install gum if dependency install not disabled
     if [[ -z "${APR_NO_DEPS:-}" ]]; then
         echo "" >&2
-        log_step "Installing dependencies..."
+        log_step "Checking dependencies..."
         install_gum && gum_ok=true
-        install_oracle && oracle_ok=true
-    else
-        # Check if already available
-        command -v gum &>/dev/null && gum_ok=true
-        { command -v oracle &>/dev/null || command -v npx &>/dev/null; } && oracle_ok=true
     fi
 
     # Verify installation
     if [[ -x "$script_path" ]]; then
-        # Get installed version
         local installed_version=""
         installed_version=$("$script_path" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
 
         echo "" >&2
         log_info "Installation complete! ${installed_version:+(v$installed_version)}"
         echo "" >&2
-        echo -e "${BOLD}What APR Does:${NC}" >&2
+        echo -e "${BOLD}What gapr Does:${NC}" >&2
         echo -e "  ${GREEN}1.${NC} Bundle your docs (README, spec, implementation)" >&2
-        echo -e "  ${GREEN}2.${NC} Send to GPT Pro 5.2 with Extended Reasoning" >&2
-        echo -e "  ${GREEN}3.${NC} Capture detailed revision suggestions" >&2
+        echo -e "  ${GREEN}2.${NC} Send to Gemini with Extended Thinking" >&2
+        echo -e "  ${GREEN}3.${NC} Stream and capture detailed revision suggestions" >&2
         echo -e "  ${GREEN}4.${NC} Track multiple rounds of refinement" >&2
         echo "" >&2
 
         # Show dependency status
         echo -e "${BOLD}Dependencies:${NC}" >&2
+        if [[ "$curl_ok" == "true" ]]; then
+            echo -e "  ${GREEN}✓${NC} curl (API calls)" >&2
+        else
+            echo -e "  ${RED}✗${NC} curl ${RED}(required)${NC}" >&2
+        fi
+        if [[ "$jq_ok" == "true" ]]; then
+            echo -e "  ${GREEN}✓${NC} jq (JSON parsing)" >&2
+        else
+            echo -e "  ${RED}✗${NC} jq ${RED}(required)${NC} - install with: brew install jq" >&2
+        fi
         if [[ "$gum_ok" == "true" ]]; then
             echo -e "  ${GREEN}✓${NC} gum (beautiful TUI)" >&2
         else
             echo -e "  ${YELLOW}○${NC} gum (optional - will fall back to basic output)" >&2
-        fi
-        if [[ "$oracle_ok" == "true" ]]; then
-            echo -e "  ${GREEN}✓${NC} oracle (ChatGPT automation)" >&2
-        else
-            echo -e "  ${RED}✗${NC} oracle ${RED}(required)${NC} - install with: npm install -g @steipete/oracle" >&2
         fi
         echo "" >&2
 
@@ -551,12 +563,12 @@ main() {
             echo -e "  ${BOLD}Run the setup wizard:${NC}" >&2
         fi
 
-        echo -e "     ${CYAN}apr setup${NC}" >&2
+        echo -e "     ${CYAN}gapr setup${NC}" >&2
         echo "" >&2
         echo -e "  ${BOLD}Then start your first revision:${NC}" >&2
-        echo -e "     ${CYAN}apr run 1${NC}" >&2
+        echo -e "     ${CYAN}GEMINI_API_KEY=... gapr run 1${NC}" >&2
         echo "" >&2
-        echo -e "${YELLOW}First run will require ChatGPT login via browser${NC}" >&2
+        echo -e "${YELLOW}Get your API key at: https://aistudio.google.com/apikey${NC}" >&2
         echo "" >&2
     else
         log_error "Installation failed - script not executable"
