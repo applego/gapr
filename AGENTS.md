@@ -198,7 +198,39 @@ Visual design:
 
 ## Oracle Integration
 
-APR uses [Oracle](https://github.com/steipete/oracle) for GPT Pro browser automation.
+APR uses [Oracle](https://github.com/steipete/oracle) for browser automation.
+
+### Gemini browser（APIキー不要）
+
+Oracle は **Gemini も API キーなしでブラウザ経由で使える**。
+Chrome の gemini.google.com セッションを Cookie で再利用するため、ログイン済みであれば API キー不要。
+
+```bash
+# Gemini 2.5 Pro をブラウザ経由で使う（APIキー不要）
+oracle -m "gemini-3-pro" --engine browser \
+  --browser-cookie-path "$HOME/Library/Application Support/Google/Chrome/Profile 1/Cookies" \
+  --browser-attachments never \
+  -p "質問"
+```
+
+**gapr ワークフローで Gemini ブラウザを使う場合は `backend: oracle` + モデル `gemini-3-pro` を指定:**
+
+```yaml
+oracle:
+  model: "gemini-3-pro"    # Gemini 2.5 Pro
+  engine: browser          # API キー不要
+  cookie_path: "~/Library/Application Support/Google/Chrome/Profile 1/Cookies"
+```
+
+**モデル名 → Oracle での指定:**
+
+| モデル | Oracle `-m` 指定 |
+|--------|-----------------|
+| Gemini 2.5 Pro (最新) | `gemini-3-pro` |
+| GPT-5.2 Pro | `gpt-5.2-pro` または `5.2 Thinking` |
+| Claude 4.5 Sonnet | `claude-4.5-sonnet` |
+
+### GPT ブラウザ（APIキー不要）
 
 Key Oracle features used:
 - `--engine browser` — Browser automation for ChatGPT webapp
