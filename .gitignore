@@ -29,3 +29,7 @@ checksums.txt
 
 # Test artifacts (ephemeral logs)
 tests/logs/
+
+# Node.js
+node_modules/
+*.log

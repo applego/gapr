@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# gapr-browser-wrapper — gapr Playwright Edition ラッパー
+#
+# このスクリプトが ~/.local/bin/gapr として配置される。
+# gapr-browser.ts を npx tsx で実行する。
+
+set -euo pipefail
+
+# gapr リポジトリのパス（変更時は GAPR_REPO_DIR 環境変数で上書き可能）
+GAPR_REPO_DIR="${GAPR_REPO_DIR:-$HOME/Documents/workspace_dev/gapr}"
+TS_SCRIPT="${GAPR_REPO_DIR}/gapr-browser.ts"
+TSX_BIN="${GAPR_REPO_DIR}/node_modules/.bin/tsx"
+
+if [[ ! -f "$TS_SCRIPT" ]]; then
+  echo "❌ gapr-browser.ts が見つかりません: $TS_SCRIPT" >&2
+  exit 1
+fi
+
+# node_modules/.bin/tsx があれば使い、なければ npx tsx
+if [[ -f "$TSX_BIN" ]]; then
+  exec "$TSX_BIN" "$TS_SCRIPT" "$@"
+else
+  exec npx tsx "$TS_SCRIPT" "$@"
+fi

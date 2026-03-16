@@ -1,0 +1,22 @@
+{
+  "name": "gapr-browser",
+  "version": "1.0.0",
+  "description": "Gemini Automated Plan Reviser - Browser Edition (Playwright)",
+  "private": true,
+  "scripts": {
+    "gapr": "tsx gapr-browser.ts",
+    "test": "tsx --test tests/unit/test_gapr_browser.ts",
+    "test:watch": "tsx --test --watch tests/unit/test_gapr_browser.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "bash -n gapr-browser-wrapper",
+    "dry-run": "tsx gapr-browser.ts run --dry-run 2>/dev/null || true"
+  },
+  "dependencies": {
+    "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.3"
+  }
+}

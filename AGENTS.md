@@ -205,6 +205,36 @@ APR uses [Oracle](https://github.com/steipete/oracle) for browser automation.
 Oracle は **Gemini も API キーなしでブラウザ経由で使える**。
 Chrome の gemini.google.com セッションを Cookie で再利用するため、ログイン済みであれば API キー不要。
 
+#### ⚠️ Claude Code（非GUI環境）での制限
+
+`oracle --engine browser -m gemini-3-pro` は macOS Keychain を使って Chrome Cookie を復号する。
+**Claude Code のターミナルプロセスからは Keychain GUI 承認ができないため失敗する。**
+
+**回避策 A（推奨）: ターミナル.app から直接実行**
+```bash
+cd ~/Documents/workspace_dev/hohho_worlds
+gapr run 1 -w <workflow> --no-preflight
+# → Keychain 承認ポップアップが出るので許可する
+```
+
+**回避策 B: プロンプトをクリップボードにコピーして Gemini Web に貼り付け**
+```bash
+# Claude Code から実行可能
+AGENTS=$(cat AGENTS.md | head -200)
+SPEC=$(cat .apr/spec/current-question.md)
+printf "...%s\n\n%s" "$AGENTS" "$SPEC" | pbcopy
+open "https://gemini.google.com/app"
+# → ブラウザで Cmd+V してペースト
+```
+
+**回避策 C: `ORACLE_BROWSER_COOKIES_JSON` で Cookie を直接渡す**
+```bash
+# ターミナル.app で一度だけ実行（Keychain 承認が出る）
+CHROME_KEY=$(security find-generic-password -a "Chrome" -s "Chrome Safe Storage" -w)
+# → 復号した Cookie JSON を ORACLE_BROWSER_COOKIES_JSON に設定
+# 詳細は oracle のドキュメントを参照
+```
+
 ```bash
 # Gemini 2.5 Pro をブラウザ経由で使う（APIキー不要）
 oracle -m "gemini-3-pro" --engine browser \
