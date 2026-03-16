@@ -200,7 +200,7 @@ call_gemini() {
     # Call the Gemini API with streaming
     local url="https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${api_key}"
 
-    local http_code
+    local http_code  # shellcheck disable=SC2034
     local tmp_headers
     tmp_headers=$(mktemp)
 
@@ -211,6 +211,7 @@ call_gemini() {
         "$url" 2>/dev/null | parse_sse_stream
 
     local curl_exit=${PIPESTATUS[0]}
+    # shellcheck disable=SC2034
     local parse_exit=${PIPESTATUS[1]}
 
     rm -f "$tmp_headers"

@@ -9,6 +9,7 @@ on:
       - "tests/unit/test_gapr_browser.ts"
       - "tsconfig.json"
       - "package.json"
+      - ".github/workflows/ci-browser.yml"
   pull_request:
     branches: [main]
     paths:
@@ -17,6 +18,7 @@ on:
       - "tests/unit/test_gapr_browser.ts"
       - "tsconfig.json"
       - "package.json"
+      - ".github/workflows/ci-browser.yml"
   workflow_dispatch:
 
 jobs:
