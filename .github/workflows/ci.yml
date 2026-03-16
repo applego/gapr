@@ -346,7 +346,7 @@ jobs:
           export APR_SKIP_VERIFY=1
 
           # Create modified installer for testing
-          sed 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/apr" "$tmp_file"|g' install.sh > /tmp/test_install.sh
+          sed 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/gapr" "$tmp_file"|g' install.sh > /tmp/test_install.sh
 
           # Run the modified installer
           bash /tmp/test_install.sh
@@ -356,24 +356,24 @@ jobs:
           export HOME="$TEST_HOME"
 
           # Check executable exists
-          if [[ ! -x "$HOME/.local/bin/apr" ]]; then
-            echo "::error::apr not installed to $HOME/.local/bin/"
+          if [[ ! -x "$HOME/.local/bin/gapr" ]]; then
+            echo "::error::gapr not installed to $HOME/.local/bin/"
             ls -la "$HOME/.local/bin/" || true
             exit 1
           fi
 
           echo "Installation successful!"
 
-      - name: Verify apr works after installation
+      - name: Verify gapr works after installation
         run: |
           export HOME="$TEST_HOME"
           export PATH="$HOME/.local/bin:$PATH"
 
           # Test version
-          apr --version
+          gapr --version
 
           # Test help (first 20 lines)
-          apr --help 2>&1 | head -20
+          gapr --help 2>&1 | head -20
 
       - name: Cleanup
         if: always()
