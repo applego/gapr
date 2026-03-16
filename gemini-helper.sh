@@ -200,7 +200,8 @@ call_gemini() {
     # Call the Gemini API with streaming
     local url="https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${api_key}"
 
-    local http_code  # shellcheck disable=SC2034
+    # shellcheck disable=SC2034
+    local http_code
     local tmp_headers
     tmp_headers=$(mktemp)
 
