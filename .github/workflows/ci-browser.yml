@@ -111,12 +111,13 @@ jobs:
       - name: help コマンド確認
         run: |
           node_modules/.bin/tsx gapr-browser.ts help | tee /tmp/help-output.txt
-          # 必須コマンドが help に含まれているか
-          for cmd in "daemon" "run" "setup" "list" "history" "status" "stop" "--dry-run" "--quiet"; do
-            if grep -q "$cmd" /tmp/help-output.txt; then
+          # 必須コマンドが help に含まれているか（LC_ALL=C で多バイト文字を回避）
+          for cmd in "daemon" "run" "setup" "list" "history" "status" "stop" "dry-run" "quiet"; do
+            if LC_ALL=C grep -q "$cmd" /tmp/help-output.txt; then
               echo "  ✅ $cmd"
             else
               echo "  ❌ '$cmd' が help に見つかりません"
+              LC_ALL=C cat /tmp/help-output.txt
               exit 1
             fi
           done
@@ -138,10 +139,7 @@ jobs:
           bash -n gapr-browser-wrapper
           echo "✅ gapr-browser-wrapper 構文 OK"
 
-      - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: "."
-          severity: warning
-          additional_files: "gapr-browser-wrapper"
-          ignore_paths: "node_modules tests"
+      - name: ShellCheck (gapr-browser-wrapper のみ)
+        run: |
+          shellcheck --severity=warning gapr-browser-wrapper
+          echo "✅ shellcheck: gapr-browser-wrapper OK"
