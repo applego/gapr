@@ -57,7 +57,9 @@ import * as http from "http";
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = "gemini-2.5-pro-preview-05-06";
+// "auto-pro" = navigate without ?model= so AI Studio uses its own latest default pro model.
+// Never hardcode a version number here — it will become stale.
+const DEFAULT_MODEL = "auto-pro";
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
 const USER_DATA_DIR =
@@ -181,7 +183,8 @@ async function ensureDaemon(): Promise<void> {
   log("🚀 daemon が未起動のため自動起動します...");
   const child = require("child_process").spawn(
     process.execPath,
-    [require.resolve("tsx/dist/cli.mjs"), __filename, "daemon"],
+    // tsx v4+ doesn't export ./dist/cli.mjs; resolve via package.json then build path
+    [require("path").join(require("path").dirname(require.resolve("tsx/package.json")), "dist", "cli.mjs"), __filename, "daemon"],
     { detached: true, stdio: "ignore", env: { ...process.env, GAPR_DAEMON_MODE: "1" } }
   );
   child.unref();
@@ -389,7 +392,10 @@ async function findInput(page: Page): Promise<ElementHandle | null> {
 async function typeAndSend(page: Page, el: ElementHandle, text: string): Promise<boolean> {
   await el.click();
   await page.waitForTimeout(300);
-  await el.type(text, { delay: 0, timeout: Math.max(60000, text.length * 3 + 30000) });
+  // Clear existing content, then insert all text at once (no per-character simulation)
+  await page.keyboard.press("Meta+a");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.insertText(text);
   log(`  入力完了: ${text.length} chars`);
   await page.waitForTimeout(1000);
 
@@ -415,6 +421,8 @@ async function checkQuota(page: Page): Promise<boolean> {
 
 async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   let last = 0, stable = 0;
+  // Wait at least 20s for Gemini to start generating before stability checks kick in
+  const MIN_WAIT_SEC = 20;
   for (let i = 0; i < maxSec; i++) {
     await page.waitForTimeout(1000);
     const text: string = await page.evaluate(() => {
@@ -430,7 +438,8 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
       }
       return full;
     });
-    if (text.length === last && text.length > 100) { if (++stable >= 5) return text; }
+    // Only start stability check after MIN_WAIT_SEC, and require meaningful response length
+    if (i >= MIN_WAIT_SEC && text.length === last && text.length > 500) { if (++stable >= 5) return text; }
     else { stable = 0; last = text.length; }
     if (i % 15 === 0 && i > 0) log(`  ... 待機中 (${i}s, ${text.length} chars)`);
   }
@@ -596,7 +605,11 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
 
   // タブ取得（URL で識別）
   const page = await getOrCreateTab(ctx, session?.url ?? null);
-  const newChatUrl = `https://aistudio.google.com/prompts/new_chat?model=${model}`;
+  // "auto-pro": let AI Studio pick its own latest default (no ?model= param)
+  // This ensures we never get stuck on a stale model version.
+  const newChatUrl = (model === "auto-pro")
+    ? "https://aistudio.google.com/prompts/new_chat"
+    : `https://aistudio.google.com/prompts/new_chat?model=${model}`;
 
   try {
     if (!session || page.url() === "about:blank" || page.url() === "") {
@@ -654,7 +667,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     log("⏳ Gemini レスポンス待機中...");
     const response = await waitForResponse(page, sent ? 300 : 30);
 
-    if (response.length > 100) {
+    if (response.length > 500) {
       log(`✅ レスポンス: ${response.length} chars`);
       fs.writeFileSync(path.join(roundPath, "response.md"), response);
     } else {
