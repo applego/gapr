@@ -419,31 +419,197 @@ async function checkQuota(page: Page): Promise<boolean> {
   });
 }
 
-async function waitForResponse(page: Page, maxSec: number): Promise<string> {
-  let last = 0, stable = 0;
-  // Wait at least 20s for Gemini to start generating before stability checks kick in
-  const MIN_WAIT_SEC = 20;
-  for (let i = 0; i < maxSec; i++) {
-    await page.waitForTimeout(1000);
-    const text: string = await page.evaluate(() => {
-      const main = document.querySelector('[role="main"], .layout-wrapper') as HTMLElement | null;
-      if (!main) return "";
-      const full = main.innerText || "";
-      const m = full.match(/Model\s+\d{1,2}:\d{2}\s*\n([\s\S]*?)(?:thumb_up|thumb_down|$)/);
-      if (m && m[1].trim().length > 50) return m[1].trim();
-      const parts = full.split("more_vert");
-      if (parts.length >= 3) {
-        const c = parts[parts.length - 1].replace(/thumb_up[\s\S]*$/, "").trim();
-        if (c.length > 50) return c;
-      }
-      return full;
-    });
-    // Only start stability check after MIN_WAIT_SEC, and require meaningful response length
-    if (i >= MIN_WAIT_SEC && text.length === last && text.length > 500) { if (++stable >= 5) return text; }
-    else { stable = 0; last = text.length; }
-    if (i % 15 === 0 && i > 0) log(`  ... 待機中 (${i}s, ${text.length} chars)`);
+// Network-observed Gemini response text (populated by page.on("response") listener).
+// AI Studio renders model responses in closed/inaccessible shadow DOM;
+// passively observing API responses avoids intercepting the request flow.
+let _interceptedResponse = "";
+
+// Parse "text" fields from a raw Gemini API JSON payload.
+function extractTextFromChunk(raw: string): string {
+  const parts: string[] = [];
+  const textMatches = raw.matchAll(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
+  for (const m of textMatches) {
+    try {
+      parts.push(JSON.parse(`"${m[1]}"`));
+    } catch {
+      parts.push(m[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"'));
+    }
   }
-  return "";
+  return parts.join("");
+}
+
+// Install a passive response listener to capture Gemini API responses.
+// Uses page.on("response") instead of page.route() to avoid interfering
+// with streaming requests (route.fetch() on SSE/chunked streams can crash).
+// Must be called before the prompt is sent.
+function installResponseInterceptor(page: Page): void {
+  _interceptedResponse = "";
+
+  page.on("response", async (response) => {
+    try {
+      const url = response.url();
+      const method = response.request().method();
+      // Log all POST responses for debugging
+      if (method === "POST") {
+        log(`🔍 POST response: ${response.status()} ${url.substring(0, 100)}`);
+      }
+      // Match any Gemini API or AI Studio backend endpoint
+      const isGeminiApi =
+        url.includes("streamGenerateContent") ||
+        url.includes("generateContent") ||
+        url.includes("/v1beta/models/") ||
+        url.includes("/v1/models/") ||
+        url.includes("alkalimakersuite") ||
+        url.includes("generativelanguage.googleapis.com") ||
+        url.includes("aiplatform.googleapis.com");
+      if (!isGeminiApi) return;
+
+      const body = await response.text().catch(() => "");
+      if (body.length < 100) return;
+
+      const extracted = extractTextFromChunk(body);
+      if (extracted.length > 0) {
+        _interceptedResponse += extracted;
+        log(`📡 Gemini レスポンス: +${extracted.length} chars (合計 ${_interceptedResponse.length})`);
+      }
+    } catch { /* ignore errors in listener */ }
+  });
+}
+
+// Extract the last model response text from AI Studio via shadow DOM traversal.
+// AI Studio uses Web Components with shadow roots — document.body.innerText doesn't work.
+// This approach walks the shadow DOM recursively using a JS string evaluated in-page.
+async function extractLastModelResponse(page: Page): Promise<string> {
+  const raw = await page.evaluate(`(function() {
+    function getDeepText(node, depth) {
+      if (!node || depth > 60) return '';
+      var result = '';
+      if (node.nodeType === 3) {
+        var t = (node.textContent || '').trim();
+        if (t) result += t + '\\n';
+      }
+      if (node.shadowRoot) {
+        for (var i = 0; i < node.shadowRoot.childNodes.length; i++) {
+          result += getDeepText(node.shadowRoot.childNodes[i], depth + 1);
+        }
+      }
+      for (var j = 0; j < node.childNodes.length; j++) {
+        result += getDeepText(node.childNodes[j], depth + 1);
+      }
+      return result;
+    }
+    var turns = Array.from(document.querySelectorAll('ms-chat-turn'));
+    if (turns.length === 0) return '';
+    // After prompt submission and generation, the LAST turn is the model response.
+    // For thinking-mode responses (Gemini with extended reasoning), the model uses 2 turns:
+    //   second-to-last = "Thoughts" (reasoning, may be large), last = main response text.
+    // Get the last turn's text. If it's short (<500 chars), also include the previous turn.
+    var lastText = getDeepText(turns[turns.length - 1], 0);
+    if (lastText.length < 500 && turns.length >= 2) {
+      var prevText = getDeepText(turns[turns.length - 2], 0);
+      // Only merge if previous turn is not the user prompt (user prompts are very long)
+      if (prevText.length > 100 && prevText.length < 30000) {
+        lastText = prevText + '\\n---\\n' + lastText;
+      }
+    }
+    return lastText;
+  })()`).catch(() => "") as string;
+
+  // Clean up UI chrome artifacts (icon names, timestamps, etc.)
+  return (raw || "")
+    .replace(/^more_vert\n/gm, "")
+    .replace(/^Model\n/gm, "")
+    .replace(/^\d{1,2}:\d{2}\n/gm, "")
+    .trim();
+}
+
+// Try to read the last model response via the Copy button + clipboard.
+// Fallback when shadow DOM traversal is insufficient.
+async function tryReadViaClipboard(page: Page): Promise<string> {
+  try {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  } catch { /* ignore if already granted */ }
+
+  // Confirmed selector: mattooltip="Copy to clipboard" (aria-label is null in current AI Studio)
+  const btns = await page.$$('button[mattooltip="Copy to clipboard"], button[mattooltip*="Copy" i]').catch(() => []);
+  if (btns.length === 0) {
+    log("  ⚠ コピーボタンが見つかりません");
+    return "";
+  }
+
+  // Click the LAST copy button (most recent model response code block)
+  await btns[btns.length - 1].click().catch(() => {});
+  log(`  📋 コピーボタンクリック (${btns.length}個中最後)`);
+  await page.waitForTimeout(800);
+
+  const text = await page.evaluate(`(async function() {
+    try { return await navigator.clipboard.readText(); }
+    catch(e) { return '__clipboard_error__:' + e; }
+  })()`).catch(() => "") as string;
+
+  if (!text || text.startsWith("__clipboard_error__")) {
+    log(`  ⚠ クリップボード読み取り失敗: ${(text ?? "").substring(0, 80)}`);
+    return "";
+  }
+  return text;
+}
+
+async function waitForResponse(page: Page, maxSec: number): Promise<string> {
+  // AI Studio renders model responses in shadow DOM — document.body.innerText won't capture them.
+  // Strategy:
+  //   1. Wait for Stop button to disappear (generation complete)
+  //   2. Extract text via shadow DOM traversal (primary — ms-chat-turn elements)
+  //   3. Fallback to clipboard (copy button click) if shadow DOM returns little
+  //   4. Last resort: body text (mostly UI chrome)
+
+  const stopSel = [
+    'button[aria-label*="Stop" i]',
+    'button:has-text("Stop")',
+  ].join(", ");
+
+  // Step 1: Wait for Stop button to appear (generation started)
+  log("  Step1: 生成開始待機...");
+  try {
+    await page.waitForSelector(stopSel, { state: "visible", timeout: 45000 });
+    log("  ▶ 生成開始");
+  } catch {
+    log("  ⚠ Stop ボタン未検出 (短い応答か既に完了)");
+  }
+
+  // Step 2: Wait for Stop button to disappear (generation complete)
+  log("  Step2: 生成完了待機...");
+  try {
+    await page.waitForSelector(stopSel, { state: "hidden", timeout: maxSec * 1000 });
+    log("  ✅ 生成完了");
+  } catch {
+    log("  ⚠ タイムアウト");
+  }
+
+  await page.waitForTimeout(2000);
+
+  // Step 3: Primary — shadow DOM traversal
+  const shadowText = await extractLastModelResponse(page);
+  log(`  Shadow DOM: ${shadowText.length} chars`);
+  if (shadowText.length > 200) {
+    return shadowText;
+  }
+
+  // Step 4: Secondary — clipboard via Copy button
+  const clipText = await tryReadViaClipboard(page);
+  log(`  Clipboard: ${clipText.length} chars`);
+  if (clipText.length > 100) {
+    return clipText;
+  }
+
+  // Step 5: API-intercepted gRPC text (usually empty for AI Studio)
+  if (_interceptedResponse.length > 100) {
+    log(`  API intercepted: ${_interceptedResponse.length} chars`);
+    return _interceptedResponse;
+  }
+
+  // Step 6: Last resort — body text
+  log("  ⚠ フォールバック: body.innerText");
+  return await page.evaluate(() => document.body.innerText).catch(() => "");
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +801,10 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
       logAlways("❌ 入力欄が見つかりません（debug-no-input.png を確認）");
       process.exit(1);
     }
+
+    // Install passive response listener BEFORE sending the prompt to capture Gemini API responses.
+    // Uses page.on("response") — non-intercepting, won't crash on streaming responses.
+    installResponseInterceptor(page);
 
     log("📋 プロンプト入力中...");
     const sent = await typeAndSend(page, inputEl, prompt);
