@@ -62,13 +62,29 @@ import * as http from "http";
 const DEFAULT_MODEL = "auto-pro";
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
-const USER_DATA_DIR =
-  process.env.CHROME_USER_DATA_DIR ??
+// Account-specific settings — mutable so multi-account fallback can switch at runtime
+let _userDataDir =
+  process.env.CHROME__userDataDir ??
   path.join(process.env.HOME!, ".gapr-playwright-profile");
 
-const CDP_PORT = parseInt(process.env.GAPR_CDP_PORT ?? "9322");
-const CDP_ENDPOINT_FILE = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
-const DAEMON_PID_FILE = "/tmp/gapr-daemon.pid";
+let _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
+let _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
+let _daemonPidFile = "/tmp/gapr-daemon.pid";
+
+/** Switch active account. index=0 → default profile/port, index>0 → named profile on port 9322+index. */
+function resolveAccount(name: string, index: number): void {
+  if (index === 0) {
+    _userDataDir = process.env.CHROME__userDataDir ?? path.join(process.env.HOME!, ".gapr-playwright-profile");
+    _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
+    _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
+    _daemonPidFile = "/tmp/gapr-daemon.pid";
+  } else {
+    _userDataDir = path.join(process.env.HOME!, `.gapr-playwright-profile-${name}`);
+    _cdpPort = 9322 + index;
+    _cdpEndpointFile = `/tmp/gapr-cdp-endpoint-${name}.txt`;
+    _daemonPidFile = `/tmp/gapr-daemon-${name}.pid`;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parsing
@@ -83,6 +99,7 @@ interface CliArgs {
   dryRun: boolean;
   includeImpl: boolean;
   quiet: boolean;
+  account?: string;  // explicit account name (skips to that account in the fallback list)
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -96,6 +113,7 @@ function parseArgs(argv: string[]): CliArgs {
   let includeImpl = false;
   let quiet = false;
 
+  let account: string | undefined;
   let i = 0;
   while (i < args.length) {
     const a = args[i];
@@ -120,12 +138,16 @@ function parseArgs(argv: string[]): CliArgs {
       model = a.split("=")[1];
     } else if (a === "--model" && args[i + 1]) {
       model = args[++i];
+    } else if (a.startsWith("--account=")) {
+      account = a.split("=")[1];
+    } else if (a === "--account" && args[i + 1]) {
+      account = args[++i];
     } else if (/^\d+$/.test(a)) {
       round = parseInt(a);
     }
     i++;
   }
-  return { command, round, workflow, forceNew, model, dryRun, includeImpl, quiet };
+  return { command, round, workflow, forceNew, model, dryRun, includeImpl, quiet, account };
 }
 
 // ---------------------------------------------------------------------------
@@ -156,20 +178,20 @@ async function fetchWsEndpoint(port: number): Promise<string> {
 }
 
 async function isDaemonRunning(): Promise<boolean> {
-  if (!fs.existsSync(CDP_ENDPOINT_FILE)) return false;
+  if (!fs.existsSync(_cdpEndpointFile)) return false;
   try {
-    await fetchWsEndpoint(CDP_PORT);
+    await fetchWsEndpoint(_cdpPort);
     return true;
   } catch {
     // endpoint file 残ってるが Chrome 死んでる → クリーンアップ
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
     return false;
   }
 }
 
 async function connectToDaemon(): Promise<BrowserContext> {
-  const wsUrl = fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim();
+  const wsUrl = fs.readFileSync(_cdpEndpointFile, "utf-8").trim();
   const browser = await chromium.connectOverCDP(wsUrl, { timeout: 10000 });
   const ctx = browser.contexts()[0];
   if (!ctx) throw new Error("CDP context が見つかりません");
@@ -241,6 +263,7 @@ interface WorkflowConfig {
   documents: { readme?: string; spec?: string; implementation?: string };
   model?: string;
   rounds: { output_dir: string };
+  accounts?: string[];  // multi-account fallback list (e.g. ["default", "work2", "personal"])
 }
 
 function loadWorkflowConfig(projectRoot: string, name: string): WorkflowConfig | null {
@@ -259,10 +282,18 @@ function parseWorkflowYaml(content: string, name: string): WorkflowConfig {
     rounds: { output_dir: `.apr/rounds/${name}` },
   };
   let inDocs = false;
+  let inAccounts = false;
+  const accounts: string[] = [];
   for (const raw of content.split("\n")) {
     const line = raw.trimEnd();
     if (!line || line.startsWith("#")) continue;
-    if (/^documents:/.test(line)) { inDocs = true; continue; }
+    if (/^accounts:/.test(line)) { inAccounts = true; inDocs = false; continue; }
+    if (inAccounts) {
+      const item = raw.match(/^\s+-\s+"?(.+?)"?\s*$/);
+      if (item) { accounts.push(item[1]); continue; }
+      if (!/^\s/.test(line)) inAccounts = false;
+    }
+    if (/^documents:/.test(line)) { inDocs = true; inAccounts = false; continue; }
     if (inDocs && /^\s+\w+:/.test(line)) {
       const m = line.match(/^\s+(\w+):\s*"?(.+?)"?\s*$/);
       if (m && ["readme", "spec", "implementation"].includes(m[1]))
@@ -277,6 +308,7 @@ function parseWorkflowYaml(content: string, name: string): WorkflowConfig {
     const ro = line.match(/^\s+output_dir:\s*"?(.+?)"?\s*$/);
     if (ro) cfg.rounds.output_dir = ro[1];
   }
+  if (accounts.length > 0) cfg.accounts = accounts;
   return cfg;
 }
 
@@ -557,10 +589,11 @@ async function tryReadViaClipboard(page: Page): Promise<string> {
 async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   // AI Studio renders model responses in shadow DOM — document.body.innerText won't capture them.
   // Strategy:
-  //   1. Wait for Stop button to disappear (generation complete)
-  //   2. Extract text via shadow DOM traversal (primary — ms-chat-turn elements)
-  //   3. Fallback to clipboard (copy button click) if shadow DOM returns little
-  //   4. Last resort: body text (mostly UI chrome)
+  //   1. Wait for Stop button to appear/disappear (generation lifecycle)
+  //   2. Poll for model response turn to be added to DOM (ms-chat-turns >= 2)
+  //   3. Extract text via shadow DOM traversal
+  //   4. Fallback to clipboard (copy button click)
+  //   5. Last resort: body text
 
   const stopSel = [
     'button[aria-label*="Stop" i]',
@@ -573,21 +606,36 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     await page.waitForSelector(stopSel, { state: "visible", timeout: 45000 });
     log("  ▶ 生成開始");
   } catch {
-    log("  ⚠ Stop ボタン未検出 (短い応答か既に完了)");
+    log("  ⚠ Stop ボタン未検出 (Flash など高速モデルは既に完了している場合がある)");
   }
 
   // Step 2: Wait for Stop button to disappear (generation complete)
   log("  Step2: 生成完了待機...");
   try {
     await page.waitForSelector(stopSel, { state: "hidden", timeout: maxSec * 1000 });
-    log("  ✅ 生成完了");
+    log("  ✅ 生成完了 (Stop 消滅)");
   } catch {
     log("  ⚠ タイムアウト");
   }
 
-  await page.waitForTimeout(2000);
+  // Step 3: Poll until model response turn appears in DOM (>=2 ms-chat-turn elements)
+  // Flash models respond in <5s — the DOM might not be updated yet after Stop disappears.
+  log("  Step3: モデルターン出現待機...");
+  const pollStart = Date.now();
+  const pollMax = 30000; // 30s max
+  while (Date.now() - pollStart < pollMax) {
+    const turnCount = await page.evaluate(`document.querySelectorAll('ms-chat-turn').length`)
+      .catch(() => 0) as number;
+    if (turnCount >= 2) {
+      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認`);
+      break;
+    }
+    await page.waitForTimeout(1000);
+    log(`  ... ターン待機中 (${Math.round((Date.now() - pollStart) / 1000)}s, turns=${turnCount})`);
+  }
+  await page.waitForTimeout(1500); // Extra settle time for DOM to finish rendering
 
-  // Step 3: Primary — shadow DOM traversal
+  // Step 4: Primary — shadow DOM traversal
   const shadowText = await extractLastModelResponse(page);
   log(`  Shadow DOM: ${shadowText.length} chars`);
   if (shadowText.length > 200) {
@@ -635,22 +683,22 @@ function nextRound(dir: string, explicit?: number): number {
 async function cmdDaemon(): Promise<void> {
   if (await isDaemonRunning()) {
     logAlways("✅ daemon は既に起動中です");
-    logAlways(`   endpoint: ${fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim()}`);
+    logAlways(`   endpoint: ${fs.readFileSync(_cdpEndpointFile, "utf-8").trim()}`);
     return;
   }
 
-  logAlways(`🚀 [daemon] Chrome 起動中 (CDP port=${CDP_PORT})...`);
-  const lock = path.join(USER_DATA_DIR, "SingletonLock");
+  logAlways(`🚀 [daemon] Chrome 起動中 (CDP port=${_cdpPort})...`);
+  const lock = path.join(_userDataDir, "SingletonLock");
   if (fs.existsSync(lock)) fs.unlinkSync(lock);
 
-  const ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
+  const ctx = await chromium.launchPersistentContext(_userDataDir, {
     headless: false,
     channel: "chrome",
     args: [
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-blink-features=AutomationControlled",
-      `--remote-debugging-port=${CDP_PORT}`,
+      `--remote-debugging-port=${_cdpPort}`,
     ],
     viewport: { width: 1400, height: 900 },
     timeout: 30000,
@@ -661,7 +709,7 @@ async function cmdDaemon(): Promise<void> {
 
   let wsUrl = "";
   for (let i = 0; i < 10; i++) {
-    try { wsUrl = await fetchWsEndpoint(CDP_PORT); break; }
+    try { wsUrl = await fetchWsEndpoint(_cdpPort); break; }
     catch { await new Promise((r) => setTimeout(r, 500)); }
   }
 
@@ -670,12 +718,12 @@ async function cmdDaemon(): Promise<void> {
     await ctx.close(); process.exit(1);
   }
 
-  fs.writeFileSync(CDP_ENDPOINT_FILE, wsUrl);
-  fs.writeFileSync(DAEMON_PID_FILE, String(process.pid));
+  fs.writeFileSync(_cdpEndpointFile, wsUrl);
+  fs.writeFileSync(_daemonPidFile, String(process.pid));
   logAlways(`✅ [daemon] 起動完了`);
   logAlways(`   WS: ${wsUrl}`);
   logAlways(`   PID: ${process.pid}`);
-  logAlways(`   プロファイル: ${USER_DATA_DIR}`);
+  logAlways(`   プロファイル: ${_userDataDir}`);
   logAlways(`\n   Google AI Studio でログインしてください（初回のみ）`);
   logAlways(`   停止: gapr stop\n`);
 
@@ -686,8 +734,8 @@ async function cmdDaemon(): Promise<void> {
   // 終了シグナル
   const cleanup = async () => {
     logAlways("\n🛑 [daemon] 停止中...");
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
     await ctx.close();
     process.exit(0);
   };
@@ -702,8 +750,8 @@ async function cmdStatus(): Promise<void> {
   const running = await isDaemonRunning();
   logAlways(running ? "✅ daemon: 起動中" : "❌ daemon: 停止中");
   if (running) {
-    logAlways(`   endpoint: ${fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim()}`);
-    const pid = fs.existsSync(DAEMON_PID_FILE) ? fs.readFileSync(DAEMON_PID_FILE, "utf-8").trim() : "不明";
+    logAlways(`   endpoint: ${fs.readFileSync(_cdpEndpointFile, "utf-8").trim()}`);
+    const pid = fs.existsSync(_daemonPidFile) ? fs.readFileSync(_daemonPidFile, "utf-8").trim() : "不明";
     logAlways(`   PID: ${pid}`);
     // タブ一覧
     try {
@@ -717,15 +765,15 @@ async function cmdStatus(): Promise<void> {
 }
 
 async function cmdStop(): Promise<void> {
-  if (!fs.existsSync(DAEMON_PID_FILE)) { logAlways("daemon は起動していません"); return; }
-  const pid = parseInt(fs.readFileSync(DAEMON_PID_FILE, "utf-8").trim());
+  if (!fs.existsSync(_daemonPidFile)) { logAlways("daemon は起動していません"); return; }
+  const pid = parseInt(fs.readFileSync(_daemonPidFile, "utf-8").trim());
   try {
     process.kill(pid, "SIGTERM");
     logAlways(`🛑 daemon (PID=${pid}) に停止シグナルを送りました`);
   } catch {
     logAlways("daemon プロセスが見つかりません（既に停止済み？）");
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
   }
 }
 
@@ -765,63 +813,87 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
   fs.writeFileSync(path.join(roundPath, "prompt.md"), prompt);
   log(`📂 Round ${roundNum} → ${roundPath}/`);
 
-  // daemon に接続（なければ自動起動）
-  await ensureDaemon();
-  const ctx = await connectToDaemon();
-
-  // タブ取得（URL で識別）
-  const page = await getOrCreateTab(ctx, session?.url ?? null);
   // "auto-pro": let AI Studio pick its own latest default (no ?model= param)
-  // This ensures we never get stuck on a stale model version.
   const newChatUrl = (model === "auto-pro")
     ? "https://aistudio.google.com/prompts/new_chat"
     : `https://aistudio.google.com/prompts/new_chat?model=${model}`;
 
-  try {
-    if (!session || page.url() === "about:blank" || page.url() === "") {
-      log(`🔗 ${newChatUrl} を開いています...`);
-      await page.goto(newChatUrl, { waitUntil: "networkidle", timeout: 60000 });
-      await page.waitForTimeout(3000);
-    } else {
-      await page.bringToFront();
-      log(`🔗 既存タブをフォアグラウンドに: ${page.url()}`);
-      await page.waitForTimeout(1000);
-    }
+  // Multi-account fallback: try each account in order until quota not exceeded
+  const accountsList = cfg.accounts?.length ? cfg.accounts : ["default"];
+  let accountIdx = 0;
+  if (args.account) {
+    const found = accountsList.indexOf(args.account);
+    if (found >= 0) accountIdx = found;
+  }
 
-    // ログイン確認
-    const inputEl = await findInput(page);
-    if (!inputEl) {
-      const needsLogin = await page.$('a[href*="accounts.google.com"], button:has-text("Sign in")');
-      if (needsLogin) {
-        logAlways("🔐 Google ログインが必要です。ブラウザでログインしてください。");
-        logAlways("   ログイン後、再度 'gapr run' を実行してください。");
-        return;
+  let ctx!: Awaited<ReturnType<typeof connectToDaemon>>;
+  let page!: import("playwright").Page;
+
+  while (accountIdx < accountsList.length) {
+    const acctName = accountsList[accountIdx];
+    resolveAccount(acctName, accountIdx);
+    if (accountIdx > 0) logAlways(`🔄 アカウント[${acctName}]で再試行 (${accountIdx + 1}/${accountsList.length})`);
+
+    // daemon に接続（なければ自動起動）
+    await ensureDaemon();
+    ctx = await connectToDaemon();
+
+    // タブ取得（2番目以降は常に新規タブ）
+    page = await getOrCreateTab(ctx, accountIdx === 0 ? (session?.url ?? null) : null);
+
+    try {
+      if (!session || accountIdx > 0 || page.url() === "about:blank" || page.url() === "") {
+        log(`🔗 ${newChatUrl} を開いています...`);
+        await page.goto(newChatUrl, { waitUntil: "networkidle", timeout: 60000 });
+        await page.waitForTimeout(3000);
+      } else {
+        await page.bringToFront();
+        log(`🔗 既存タブをフォアグラウンドに: ${page.url()}`);
+        await page.waitForTimeout(1000);
       }
-      await page.screenshot({ path: path.join(roundPath, "debug-no-input.png"), fullPage: true });
-      logAlways("❌ 入力欄が見つかりません（debug-no-input.png を確認）");
-      process.exit(1);
-    }
 
-    // Install passive response listener BEFORE sending the prompt to capture Gemini API responses.
-    // Uses page.on("response") — non-intercepting, won't crash on streaming responses.
-    installResponseInterceptor(page);
+      // ログイン確認
+      const inputEl = await findInput(page);
+      if (!inputEl) {
+        const needsLogin = await page.$('a[href*="accounts.google.com"], button:has-text("Sign in")');
+        if (needsLogin) {
+          logAlways(`🔐 [${acctName}] Google ログインが必要です。ブラウザでログインしてください。`);
+          logAlways("   ログイン後、再度 'gapr run' を実行してください。");
+          return;
+        }
+        await page.screenshot({ path: path.join(roundPath, "debug-no-input.png"), fullPage: true });
+        logAlways("❌ 入力欄が見つかりません（debug-no-input.png を確認）");
+        process.exit(1);
+      }
 
-    log("📋 プロンプト入力中...");
-    const sent = await typeAndSend(page, inputEl, prompt);
-    if (!sent) {
-      log("⚠️  送信不明");
-      await page.screenshot({ path: path.join(roundPath, "debug-send.png") });
-    } else {
-      log("✅ 送信完了");
-    }
+      // Install passive response listener BEFORE sending the prompt to capture Gemini API responses.
+      // Uses page.on("response") — non-intercepting, won't crash on streaming responses.
+      installResponseInterceptor(page);
 
-    // Quota チェック
-    await page.waitForTimeout(3000);
-    if (await checkQuota(page)) {
-      logAlways("❌ クォータ超過！30分後に再試行してください");
-      await page.screenshot({ path: path.join(roundPath, "quota-error.png") });
-      process.exit(10);
-    }
+      log("📋 プロンプト入力中...");
+      const sent = await typeAndSend(page, inputEl, prompt);
+      if (!sent) {
+        log("⚠️  送信不明");
+        await page.screenshot({ path: path.join(roundPath, "debug-send.png") });
+      } else {
+        log("✅ 送信完了");
+      }
+
+      // Quota チェック
+      await page.waitForTimeout(3000);
+      if (await checkQuota(page)) {
+        logAlways(`❌ [${acctName}] クォータ超過`);
+        await page.screenshot({ path: path.join(roundPath, `quota-error-${acctName}.png`) });
+        accountIdx++;
+        if (accountIdx < accountsList.length) {
+          logAlways(`🔄 次のアカウント [${accountsList[accountIdx]}] に切替...`);
+          await ctx.browser()?.close();
+          continue;
+        }
+        logAlways("❌ 全アカウントのクォータ超過。後で再試行してください。");
+        process.exit(10);
+      }
+      break; // quota OK → proceed
 
     // セッションURL保存（new_chat → /prompts/<id> に変わるタイミング）
     await page.waitForTimeout(5000);
@@ -849,11 +921,13 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     await page.screenshot({ path: path.join(roundPath, "screenshot.png"), fullPage: true });
     logAlways(`\n🎉 Round ${roundNum} 完了 → ${roundPath}/`);
 
-  } catch (err) {
-    logAlways("❌ エラー:", err);
-    await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
-    process.exit(1);
-  }
+    } catch (err) {
+      logAlways("❌ エラー:", err);
+      await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
+      process.exit(1);
+    }
+  } // end while (multi-account loop)
+
   // タブは残す（daemon が管理）。CDP接続のみ閉じる。
   await ctx.browser()?.close();
 }
@@ -990,8 +1064,8 @@ API key 不要。Google AI Studio をブラウザで自動操作。
 
 ━━ 環境変数 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  CHROME_USER_DATA_DIR    ブラウザプロファイル（デフォルト: ~/.gapr-playwright-profile）
-  GAPR_CDP_PORT           CDP ポート番号（デフォルト: 9322）
+  CHROME__userDataDir    ブラウザプロファイル（デフォルト: ~/.gapr-playwright-profile）
+  GAPR__cdpPort           CDP ポート番号（デフォルト: 9322）
   GAPR_CDP_FILE           endpoint ファイルパス（デフォルト: /tmp/gapr-cdp-endpoint.txt）
 `);
 }
