@@ -508,13 +508,49 @@ function installResponseInterceptor(page: Page): void {
   });
 }
 
-// Extract the last model response text from AI Studio via shadow DOM traversal.
-// AI Studio uses Web Components with shadow roots — document.body.innerText doesn't work.
-// This approach walks the shadow DOM recursively using a JS string evaluated in-page.
+// Extract the last model response text from AI Studio.
+// Uses Playwright's pierce/ selector engine to find elements inside shadow DOM.
+// pierce/ is Playwright's built-in mechanism that crosses shadow boundaries,
+// fixing the issue where document.querySelectorAll() misses elements in shadow roots.
 async function extractLastModelResponse(page: Page): Promise<string> {
+  // Primary: Playwright pierce/ selector — works regardless of shadow DOM depth.
+  // pierce/ms-chat-turn finds ms-chat-turn elements inside any shadow host.
+  const TURN_SELECTORS = [
+    "pierce/ms-chat-turn",
+    "pierce/.chat-turn",
+    "pierce/[data-turn-role='model']",
+    "pierce/model-response",
+    "pierce/.model-response-text",
+  ];
+
+  for (const sel of TURN_SELECTORS) {
+    try {
+      const locator = page.locator(sel);
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+
+      // Last turn = model response. For thinking-mode, second-to-last = "Thoughts".
+      const lastText = await locator.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (lastText.trim().length < 500 && count >= 2) {
+        // Possibly truncated — also grab second-to-last if it looks like model output
+        const prevText = await locator.nth(count - 2).innerText({ timeout: 3000 }).catch(() => "");
+        if (prevText.length > 100 && prevText.length < 30000) {
+          const merged = prevText + "\n---\n" + lastText;
+          log(`  pierce/${sel}: ${merged.length} chars (merged last 2 turns)`);
+          return cleanUiChrome(merged);
+        }
+      }
+      if (lastText.trim().length > 0) {
+        log(`  pierce selector matched: ${sel} — ${lastText.length} chars`);
+        return cleanUiChrome(lastText);
+      }
+    } catch { /* try next */ }
+  }
+
+  // Fallback: evaluate-based deep shadow DOM traversal (legacy, may miss deep roots)
   const raw = await page.evaluate(`(function() {
     function getDeepText(node, depth) {
-      if (!node || depth > 60) return '';
+      if (!node || depth > 80) return '';
       var result = '';
       if (node.nodeType === 3) {
         var t = (node.textContent || '').trim();
@@ -530,48 +566,25 @@ async function extractLastModelResponse(page: Page): Promise<string> {
       }
       return result;
     }
-
-    // Try multiple selectors — AI Studio may rename components across versions
-    var selectors = [
-      'ms-chat-turn',
-      '.chat-turn',
-      '[data-turn-role="model"]',
-      'model-response',
-      '.model-response-text',
-      '.response-container',
-    ];
+    var selectors = ['ms-chat-turn','.chat-turn','[data-turn-role="model"]','model-response','.model-response-text','.response-container'];
     var turns = [];
     for (var s = 0; s < selectors.length; s++) {
       turns = Array.from(document.querySelectorAll(selectors[s]));
       if (turns.length > 0) break;
     }
-
     if (turns.length === 0) {
-      // Fallback: look for markdown-rendered content areas (common in AI Studio)
       var mdContainers = document.querySelectorAll('.markdown-content, .response-text, [class*="message-content"], [class*="model-response"]');
-      if (mdContainers.length > 0) {
-        var lastMd = mdContainers[mdContainers.length - 1];
-        return getDeepText(lastMd, 0);
-      }
+      if (mdContainers.length > 0) return getDeepText(mdContainers[mdContainers.length - 1], 0);
       return '';
     }
-
-    // After prompt submission and generation, the LAST turn is the model response.
-    // For thinking-mode responses (Gemini with extended reasoning), the model uses 2 turns:
-    //   second-to-last = "Thoughts" (reasoning, may be large), last = main response text.
-    // Get the last turn's text. If it's short (<500 chars), also include the previous turn.
     var lastText = getDeepText(turns[turns.length - 1], 0);
     if (lastText.length < 500 && turns.length >= 2) {
       var prevText = getDeepText(turns[turns.length - 2], 0);
-      // Only merge if previous turn is not the user prompt (user prompts are very long)
-      if (prevText.length > 100 && prevText.length < 30000) {
-        lastText = prevText + '\\n---\\n' + lastText;
-      }
+      if (prevText.length > 100 && prevText.length < 30000) lastText = prevText + '\\n---\\n' + lastText;
     }
     return lastText;
   })()`).catch(() => "") as string;
 
-  // Clean up UI chrome artifacts (icon names, timestamps, Material icons, settings labels)
   return cleanUiChrome(raw || "");
 }
 
@@ -661,15 +674,15 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   }
 
   // Step 3: Poll until model response turn appears in DOM (>=2 ms-chat-turn elements)
-  // Flash models respond in <5s — the DOM might not be updated yet after Stop disappears.
+  // Use Playwright's pierce/ selector to find elements inside shadow DOM.
+  // document.querySelectorAll() misses elements nested inside shadow roots.
   log("  Step3: モデルターン出現待機...");
   const pollStart = Date.now();
   const pollMax = 30000; // 30s max
   while (Date.now() - pollStart < pollMax) {
-    const turnCount = await page.evaluate(`document.querySelectorAll('ms-chat-turn').length`)
-      .catch(() => 0) as number;
+    const turnCount = await page.locator("pierce/ms-chat-turn").count().catch(() => 0);
     if (turnCount >= 2) {
-      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認`);
+      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認 (pierce)`);
       break;
     }
     await page.waitForTimeout(1000);
