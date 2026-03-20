@@ -954,6 +954,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
 
   let ctx!: Awaited<ReturnType<typeof connectToDaemon>>;
   let page!: import("playwright").Page;
+  let sentResult = false; // hoisted out of while so response capture can use it after break
 
   while (accountIdx < accountsList.length) {
     const acctName = accountsList[accountIdx];
@@ -1007,8 +1008,8 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
       installResponseInterceptor(page);
 
       log("📋 プロンプト入力中...");
-      const sent = await typeAndSend(page, inputEl, prompt);
-      if (!sent) {
+      sentResult = await typeAndSend(page, inputEl, prompt);
+      if (!sentResult) {
         log("⚠️  送信不明");
         await page.screenshot({ path: path.join(roundPath, "debug-send.png") });
       } else {
@@ -1029,13 +1030,23 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
         logAlways("❌ 全アカウントのクォータ超過。後で再試行してください。");
         process.exit(10);
       }
-      break; // quota OK → proceed
+      break; // quota OK → proceed (response capture runs after while loop)
 
+    } catch (err) {
+      logAlways("❌ エラー:", err);
+      await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
+      process.exit(1);
+    }
+  } // end while (multi-account loop)
+
+  // Response capture runs here — AFTER the while loop exits via break (quota OK).
+  // Previously this code was dead (inside the try block before the break).
+  try {
     // セッションURL保存（new_chat → /prompts/<id> に変わるタイミング）
     await page.waitForTimeout(5000);
     const curUrl = page.url();
     if (curUrl.includes("/prompts/") && !curUrl.includes("new_chat")) {
-      saveSession(projectRoot, args.workflow, model, curUrl, roundNum);
+      saveSession(projectRoot, cfg.name ?? args.workflow, model, curUrl, roundNum);
       log(`💾 セッションURL保存: ${curUrl}`);
       fs.writeFileSync(path.join(roundPath, "session-url.txt"), curUrl);
     }
@@ -1043,7 +1054,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     await page.screenshot({ path: path.join(roundPath, "post-send.png"), fullPage: true });
 
     log("⏳ Gemini レスポンス待機中...");
-    const response = await waitForResponse(page, sent ? 300 : 30);
+    const response = await waitForResponse(page, sentResult ? 300 : 30);
 
     const isExtractionFailure = response.startsWith("[GAPR_EXTRACTION_FAILED]");
     if (!isExtractionFailure && response.length > 500) {
@@ -1062,13 +1073,11 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
 
     await page.screenshot({ path: path.join(roundPath, "screenshot.png"), fullPage: true });
     logAlways(`\n🎉 Round ${roundNum} 完了 → ${roundPath}/`);
-
-    } catch (err) {
-      logAlways("❌ エラー:", err);
-      await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
-      process.exit(1);
-    }
-  } // end while (multi-account loop)
+  } catch (err) {
+    logAlways("❌ レスポンスキャプチャエラー:", err);
+    await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
+    process.exit(1);
+  }
 
   // タブは残す（daemon が管理）。CDP接続のみ閉じる。
   await ctx.browser()?.close();
