@@ -539,29 +539,27 @@ function installResponseInterceptor(page: Page): void {
 // data-turn-role="Model" (capitalized) identifies model response containers inside virtual scroll.
 // Virtual scroll renders content lazily — caller should scroll to bottom before calling this.
 async function extractLastModelResponse(page: Page): Promise<string> {
-  // Step A: Bring the last ms-chat-turn into view to trigger Angular CDK virtual scroll rendering.
-  // scrollIntoViewIfNeeded is more reliable than scrollTop assignment for Angular virtual scroll.
+  // Step A: Scroll ms-autoscroll-container to ABSOLUTE BOTTOM to trigger Angular CDK rendering.
+  // After generation, the model response is at the bottom. Scrolling to absolute bottom ensures
+  // the END of the last model turn is in the visible viewport, triggering virtual scroll rendering.
+  // scrollIntoViewIfNeeded is insufficient — it only shows the top edge of the model turn.
   try {
-    const lastTurn = page.locator("ms-chat-turn").last();
-    const turnCount = await lastTurn.count().catch(() => 0);
-    if (turnCount > 0) {
-      await lastTurn.scrollIntoViewIfNeeded({ timeout: 5000 });
-      log("  ✅ scroll: ms-chat-turn scrolled into view");
-    } else {
-      // Fallback: scroll ms-autoscroll-container directly
-      await page.evaluate(`(function() {
-        var c = document.querySelector('ms-autoscroll-container');
-        if (c) { c.scrollTop = c.scrollHeight; c.dispatchEvent(new Event('scroll', {bubbles: true})); }
-      })()`);
-    }
-    await page.waitForTimeout(1500);
+    await page.evaluate(`(function() {
+      var c = document.querySelector('ms-autoscroll-container');
+      if (c) {
+        c.scrollTop = c.scrollHeight;
+        c.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }
+    })()`);
+    await page.waitForTimeout(3000); // 3s for Angular CDK virtual scroll to fully render
+    log("  ✅ scroll: ms-autoscroll-container → absolute bottom");
     // Wait until at least one model turn-content has real text.
     await page.waitForFunction(`(function() {
       var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
       return Array.from(containers).some(function(c) {
-        return c.textContent && c.textContent.trim().length > 50;
+        return (c.innerText || c.textContent || '').trim().length > 200;
       });
-    })()`, { timeout: 12000 });
+    })()`, { timeout: 15000 });
     log("  ✅ virtual scroll: model turn-content rendered");
   } catch { /* timeout ok — content may already be rendered or selector changed */ }
 
@@ -570,7 +568,15 @@ async function extractLastModelResponse(page: Page): Promise<string> {
     const turnContent = page.locator('[data-turn-role="Model"] .turn-content');
     const count = await turnContent.count().catch(() => 0);
     if (count > 0) {
-      const text = await turnContent.last().innerText({ timeout: 5000 }).catch(() => "");
+      // Try innerText first (visible text only), fall back to textContent (includes collapsed thoughts)
+      let text = await turnContent.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (text.trim().length < 200) {
+        const tc = await turnContent.last().textContent({ timeout: 5000 }).catch(() => "");
+        if (tc && tc.trim().length > text.trim().length) {
+          text = tc;
+          log(`  turn-content: using textContent (${text.length} chars)`);
+        }
+      }
       if (text.trim().length > 200) {
         log(`  turn-content: ${text.length} chars`);
         return cleanUiChrome(text);
