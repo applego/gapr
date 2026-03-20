@@ -128,7 +128,7 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (a === "--quiet" || a === "-q") {
       quiet = true;
     } else if (a === "--version") {
-      console.log("gapr 2.2.0 (Playwright CDP edition)");
+      console.log("gapr 2.2.8 (Playwright CDP edition)");
       process.exit(0);
     } else if (a.startsWith("--workflow=")) {
       workflow = a.split("=")[1];
@@ -588,11 +588,17 @@ async function extractLastModelResponse(page: Page): Promise<string> {
           log(`  turn-content: using textContent (${text.length} chars)`);
         }
       }
+      // Detect AI Studio error response (e.g., "An internal error has occurred.")
+      const preview80 = text.trim().substring(0, 80);
+      if (/an internal error has occurred/i.test(text) || /error_outline/i.test(text)) {
+        log(`  ⚠ AI Studio error detected in turn-content: "${preview80}"`);
+        return `[GAPR_AISTUDIO_ERROR: ${text.trim()}]`;
+      }
       if (text.trim().length > 200) {
         log(`  turn-content: ${text.length} chars`);
         return cleanUiChrome(text);
       }
-      log(`  turn-content: too short (${text.length} chars), preview: "${text.trim().substring(0, 80).replace(/\n/g, "\\n")}"`);
+      log(`  turn-content: too short (${text.length} chars), preview: "${preview80.replace(/\n/g, "\\n")}"`);
       log(`  turn-content count: ${count}`);
     }
   } catch { /* try next */ }
@@ -827,6 +833,11 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   // Step 4: Primary — shadow DOM traversal
   const shadowText = await extractLastModelResponse(page);
   log(`  Shadow DOM: ${shadowText.length} chars`);
+  // Propagate AI Studio error marker immediately — don't fall through to clipboard
+  if (shadowText.startsWith("[GAPR_AISTUDIO_ERROR")) {
+    log(`  ❌ AI Studio error — returning error marker`);
+    return shadowText;
+  }
   if (shadowText.length > 200) {
     return shadowText;
   }
@@ -1131,11 +1142,16 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     const response = await waitForResponse(page, sentResult ? 300 : 30);
 
     const isExtractionFailure = response.startsWith("[GAPR_EXTRACTION_FAILED]");
-    if (!isExtractionFailure && response.length > 500) {
+    const isAiStudioError = response.startsWith("[GAPR_AISTUDIO_ERROR");
+    if (!isExtractionFailure && !isAiStudioError && response.length > 500) {
       log(`✅ レスポンス: ${response.length} chars`);
       fs.writeFileSync(path.join(roundPath, "response.md"), response);
     } else {
-      log(`⚠️  レスポンス不十分 (${response.length} chars, extraction_failed=${isExtractionFailure}) → 診断情報保存`);
+      if (isAiStudioError) {
+        log(`❌ AI Studio エラー — response.md を上書きしません`);
+        fs.writeFileSync(path.join(roundPath, "error.txt"), response);
+      }
+      log(`⚠️  レスポンス不十分 (${response.length} chars, extraction_failed=${isExtractionFailure}, aistudio_error=${isAiStudioError}) → 診断情報保存`);
       const full = await page.evaluate(() => document.body.innerText).catch(() => "");
       const cleaned = cleanUiChrome(full);
       // Save both raw (for debugging) and cleaned (for possible use)
