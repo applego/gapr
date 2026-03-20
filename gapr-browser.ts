@@ -128,7 +128,7 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (a === "--quiet" || a === "-q") {
       quiet = true;
     } else if (a === "--version") {
-      console.log("gapr 1.1.0 (Playwright CDP edition)");
+      console.log("gapr 2.2.0 (Playwright CDP edition)");
       process.exit(0);
     } else if (a.startsWith("--workflow=")) {
       workflow = a.split("=")[1];
@@ -535,18 +535,44 @@ function installResponseInterceptor(page: Page): void {
 }
 
 // Extract the last model response text from AI Studio.
-// Uses Playwright's pierce/ selector engine to find elements inside shadow DOM.
-// pierce/ is Playwright's built-in mechanism that crosses shadow boundaries,
-// fixing the issue where document.querySelectorAll() misses elements in shadow roots.
+// AI Studio 2026-Q1+: ms-chat-turn elements are at document root level (no shadow DOM).
+// data-turn-role="Model" (capitalized) identifies model response containers inside virtual scroll.
+// Virtual scroll renders content lazily — caller should scroll to bottom before calling this.
 async function extractLastModelResponse(page: Page): Promise<string> {
-  // Primary: Playwright pierce/ selector — works regardless of shadow DOM depth.
-  // pierce/ms-chat-turn finds ms-chat-turn elements inside any shadow host.
+  // Step A: Scroll to bottom to trigger virtual scroll rendering of the last model turn.
+  try {
+    await page.evaluate(`window.scrollTo(0, document.body.scrollHeight)`);
+    await page.waitForTimeout(800);
+    // Wait until at least one model turn-content has real text.
+    await page.waitForFunction(`(function() {
+      var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+      return Array.from(containers).some(function(c) {
+        return c.textContent && c.textContent.trim().length > 50;
+      });
+    })()`, { timeout: 8000 });
+    log("  ✅ virtual scroll: model turn-content rendered");
+  } catch { /* timeout ok — content may already be rendered or selector changed */ }
+
+  // Step B: Primary — [data-turn-role="Model"] .turn-content (AI Studio 2026-Q1+ DOM)
+  try {
+    const turnContent = page.locator('[data-turn-role="Model"] .turn-content');
+    const count = await turnContent.count().catch(() => 0);
+    if (count > 0) {
+      const text = await turnContent.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (text.trim().length > 200) {
+        log(`  turn-content: ${text.length} chars`);
+        return cleanUiChrome(text);
+      }
+      log(`  turn-content: too short (${text.length} chars), trying next`);
+    }
+  } catch { /* try next */ }
+
+  // Step C: Direct ms-chat-turn locator (no pierce/ — shadow DOM removed in AI Studio 2026-Q1)
   const TURN_SELECTORS = [
-    "pierce/ms-chat-turn",
-    "pierce/.chat-turn",
-    "pierce/[data-turn-role='model']",
-    "pierce/model-response",
-    "pierce/.model-response-text",
+    "ms-chat-turn",
+    ".chat-turn",
+    "model-response",
+    ".model-response-text",
   ];
 
   for (const sel of TURN_SELECTORS) {
@@ -562,18 +588,18 @@ async function extractLastModelResponse(page: Page): Promise<string> {
         const prevText = await locator.nth(count - 2).innerText({ timeout: 3000 }).catch(() => "");
         if (prevText.length > 100 && prevText.length < 30000) {
           const merged = prevText + "\n---\n" + lastText;
-          log(`  pierce/${sel}: ${merged.length} chars (merged last 2 turns)`);
+          log(`  ${sel}: ${merged.length} chars (merged last 2 turns)`);
           return cleanUiChrome(merged);
         }
       }
       if (lastText.trim().length > 0) {
-        log(`  pierce selector matched: ${sel} — ${lastText.length} chars`);
+        log(`  selector matched: ${sel} — ${lastText.length} chars`);
         return cleanUiChrome(lastText);
       }
     } catch { /* try next */ }
   }
 
-  // Fallback: evaluate-based deep shadow DOM traversal (legacy, may miss deep roots)
+  // Step D: evaluate-based fallback (handles both old shadow DOM and new flat DOM patterns)
   const raw = await page.evaluate(`(function() {
     function getDeepText(node, depth) {
       if (!node || depth > 80) return '';
@@ -592,6 +618,14 @@ async function extractLastModelResponse(page: Page): Promise<string> {
       }
       return result;
     }
+    // AI Studio 2026-Q1+: data-turn-role uses capitalized "Model"
+    var modelContainers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+    if (modelContainers.length > 0) {
+      var lastContent = modelContainers[modelContainers.length - 1];
+      var contentText = getDeepText(lastContent, 0);
+      if (contentText.length > 100) return contentText;
+    }
+    // Legacy: scan ms-chat-turn (covers both lowercase and uppercase data-turn-role)
     var selectors = ['ms-chat-turn','.chat-turn','[data-turn-role="model"]','model-response','.model-response-text','.response-container'];
     var turns = [];
     for (var s = 0; s < selectors.length; s++) {
@@ -700,15 +734,15 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   }
 
   // Step 3: Poll until model response turn appears in DOM (>=2 ms-chat-turn elements)
-  // Use Playwright's pierce/ selector to find elements inside shadow DOM.
-  // document.querySelectorAll() misses elements nested inside shadow roots.
+  // AI Studio 2026-Q1+: ms-chat-turn elements are at document root (no shadow DOM).
+  // Use direct locator without pierce/ which fails when there are no shadow roots.
   log("  Step3: モデルターン出現待機...");
   const pollStart = Date.now();
   const pollMax = 30000; // 30s max
   while (Date.now() - pollStart < pollMax) {
-    const turnCount = await page.locator("pierce/ms-chat-turn").count().catch(() => 0);
+    const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
     if (turnCount >= 2) {
-      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認 (pierce)`);
+      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認`);
       break;
     }
     await page.waitForTimeout(1000);
