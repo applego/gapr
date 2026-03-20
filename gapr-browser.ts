@@ -539,17 +539,25 @@ function installResponseInterceptor(page: Page): void {
 // data-turn-role="Model" (capitalized) identifies model response containers inside virtual scroll.
 // Virtual scroll renders content lazily — caller should scroll to bottom before calling this.
 async function extractLastModelResponse(page: Page): Promise<string> {
-  // Step A: Scroll to bottom to trigger virtual scroll rendering of the last model turn.
+  // Step A: Scroll ms-autoscroll-container (AI Studio's virtual scroll host) to bottom.
+  // NOTE: window.scrollTo does NOT affect ms-autoscroll-container and may derender content.
   try {
-    await page.evaluate(`window.scrollTo(0, document.body.scrollHeight)`);
-    await page.waitForTimeout(800);
+    await page.evaluate(`(function() {
+      var container = document.querySelector('ms-autoscroll-container');
+      if (container) {
+        container.scrollTop = container.scrollHeight;
+      } else {
+        window.scrollTo(0, document.body.scrollHeight);
+      }
+    })()`);
+    await page.waitForTimeout(1200);
     // Wait until at least one model turn-content has real text.
     await page.waitForFunction(`(function() {
       var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
       return Array.from(containers).some(function(c) {
         return c.textContent && c.textContent.trim().length > 50;
       });
-    })()`, { timeout: 8000 });
+    })()`, { timeout: 10000 });
     log("  ✅ virtual scroll: model turn-content rendered");
   } catch { /* timeout ok — content may already be rendered or selector changed */ }
 
@@ -581,19 +589,22 @@ async function extractLastModelResponse(page: Page): Promise<string> {
       const count = await locator.count().catch(() => 0);
       if (count === 0) continue;
 
-      // Last turn = model response. For thinking-mode, second-to-last = "Thoughts".
-      const lastText = await locator.last().innerText({ timeout: 5000 }).catch(() => "");
-      if (lastText.trim().length < 500 && count >= 2) {
-        // Possibly truncated — also grab second-to-last if it looks like model output
-        const prevText = await locator.nth(count - 2).innerText({ timeout: 3000 }).catch(() => "");
-        if (prevText.length > 100 && prevText.length < 30000) {
-          const merged = prevText + "\n---\n" + lastText;
-          log(`  ${sel}: ${merged.length} chars (merged last 2 turns)`);
-          return cleanUiChrome(merged);
+      // Last turn = model response. Try innerText first, fallback to textContent.
+      let lastText = await locator.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (lastText.trim().length < 100) {
+        // innerText can return empty for virtualized/hidden content; textContent is layout-independent
+        const tc = await locator.last().textContent({ timeout: 3000 }).catch(() => "");
+        if (tc && tc.trim().length > lastText.trim().length) {
+          lastText = tc;
+          log(`  ${sel}: using textContent (innerText was too short)`);
         }
       }
-      if (lastText.trim().length > 0) {
+      if (lastText.trim().length > 200) {
         log(`  selector matched: ${sel} — ${lastText.length} chars`);
+        return cleanUiChrome(lastText);
+      }
+      if (lastText.trim().length > 0) {
+        log(`  selector matched: ${sel} — ${lastText.length} chars (short)`);
         return cleanUiChrome(lastText);
       }
     } catch { /* try next */ }
@@ -749,6 +760,14 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     log(`  ... ターン待機中 (${Math.round((Date.now() - pollStart) / 1000)}s, turns=${turnCount})`);
   }
   await page.waitForTimeout(1500); // Extra settle time for DOM to finish rendering
+
+  // Ensure ms-autoscroll-container is scrolled to bottom before extraction.
+  // AI Studio uses this custom element as the virtual scroll host; window.scrollTo has no effect on it.
+  await page.evaluate(`(function() {
+    var c = document.querySelector('ms-autoscroll-container');
+    if (c) c.scrollTop = c.scrollHeight;
+  })()`).catch(() => {});
+  await page.waitForTimeout(500);
 
   // Step 4: Primary — shadow DOM traversal
   const shadowText = await extractLastModelResponse(page);
