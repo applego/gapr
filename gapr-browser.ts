@@ -551,16 +551,27 @@ async function extractLastModelResponse(page: Page): Promise<string> {
         c.dispatchEvent(new Event('scroll', { bubbles: true }));
       }
     })()`);
-    await page.waitForTimeout(3000); // 3s for Angular CDK virtual scroll to fully render
+    await page.waitForTimeout(1000); // Initial settle
     log("  ✅ scroll: ms-autoscroll-container → absolute bottom");
-    // Wait until at least one model turn-content has real text.
-    await page.waitForFunction(`(function() {
-      var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
-      return Array.from(containers).some(function(c) {
-        return (c.innerText || c.textContent || '').trim().length > 200;
-      });
-    })()`, { timeout: 15000 });
-    log("  ✅ virtual scroll: model turn-content rendered");
+    // Re-scroll every 1s (Angular CDK may need scroll events to trigger re-render)
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(`(function() {
+        var c = document.querySelector('ms-autoscroll-container');
+        if (c) { c.scrollTop = c.scrollHeight; c.dispatchEvent(new Event('scroll', { bubbles: true })); }
+      })()`);
+      await page.waitForTimeout(1000);
+      const rendered = await page.evaluate(`(function() {
+        var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+        var max = 0;
+        containers.forEach(function(c) { var l = (c.innerText || c.textContent || '').trim().length; if (l > max) max = l; });
+        return max;
+      })()`).catch(() => 0) as number;
+      log(`  scroll attempt ${i + 1}: turn-content max = ${rendered} chars`);
+      if (rendered > 200) {
+        log("  ✅ virtual scroll: model turn-content rendered");
+        break;
+      }
+    }
   } catch { /* timeout ok — content may already be rendered or selector changed */ }
 
   // Step B: Primary — [data-turn-role="Model"] .turn-content (AI Studio 2026-Q1+ DOM)
