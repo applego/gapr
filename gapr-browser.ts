@@ -539,25 +539,29 @@ function installResponseInterceptor(page: Page): void {
 // data-turn-role="Model" (capitalized) identifies model response containers inside virtual scroll.
 // Virtual scroll renders content lazily — caller should scroll to bottom before calling this.
 async function extractLastModelResponse(page: Page): Promise<string> {
-  // Step A: Scroll ms-autoscroll-container (AI Studio's virtual scroll host) to bottom.
-  // NOTE: window.scrollTo does NOT affect ms-autoscroll-container and may derender content.
+  // Step A: Bring the last ms-chat-turn into view to trigger Angular CDK virtual scroll rendering.
+  // scrollIntoViewIfNeeded is more reliable than scrollTop assignment for Angular virtual scroll.
   try {
-    await page.evaluate(`(function() {
-      var container = document.querySelector('ms-autoscroll-container');
-      if (container) {
-        container.scrollTop = container.scrollHeight;
-      } else {
-        window.scrollTo(0, document.body.scrollHeight);
-      }
-    })()`);
-    await page.waitForTimeout(1200);
+    const lastTurn = page.locator("ms-chat-turn").last();
+    const turnCount = await lastTurn.count().catch(() => 0);
+    if (turnCount > 0) {
+      await lastTurn.scrollIntoViewIfNeeded({ timeout: 5000 });
+      log("  ✅ scroll: ms-chat-turn scrolled into view");
+    } else {
+      // Fallback: scroll ms-autoscroll-container directly
+      await page.evaluate(`(function() {
+        var c = document.querySelector('ms-autoscroll-container');
+        if (c) { c.scrollTop = c.scrollHeight; c.dispatchEvent(new Event('scroll', {bubbles: true})); }
+      })()`);
+    }
+    await page.waitForTimeout(1500);
     // Wait until at least one model turn-content has real text.
     await page.waitForFunction(`(function() {
       var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
       return Array.from(containers).some(function(c) {
         return c.textContent && c.textContent.trim().length > 50;
       });
-    })()`, { timeout: 10000 });
+    })()`, { timeout: 12000 });
     log("  ✅ virtual scroll: model turn-content rendered");
   } catch { /* timeout ok — content may already be rendered or selector changed */ }
 
@@ -682,20 +686,32 @@ function cleanUiChrome(text: string): string {
 }
 
 // Try to read the last model response via the Copy button + clipboard.
-// Fallback when shadow DOM traversal is insufficient.
+// First ensures the model response turn is scrolled into view (AI Studio uses virtual scroll;
+// model turn copy buttons only appear in DOM when the turn is rendered).
 async function tryReadViaClipboard(page: Page): Promise<string> {
   try {
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   } catch { /* ignore if already granted */ }
 
-  // Confirmed selector: mattooltip="Copy to clipboard" (aria-label is null in current AI Studio)
-  const btns = await page.$$('button[mattooltip="Copy to clipboard"], button[mattooltip*="Copy" i]').catch(() => []);
+  // Scroll the last ms-chat-turn into view so the model turn copy buttons appear in DOM.
+  // Without this, all copy buttons belong to the user's prompt turn (virtual scroll hides model turn).
+  try {
+    await page.locator("ms-chat-turn").last().scrollIntoViewIfNeeded({ timeout: 5000 });
+    await page.waitForTimeout(2000); // Wait for Angular CDK to render the model turn
+    log("  📍 ms-chat-turn scrolled into view for clipboard");
+  } catch { /* ignore */ }
+
+  // Prefer buttons scoped to Model turn. Fall back to all copy buttons if none found.
+  let btns = await page.$$('[data-turn-role="Model"] button[mattooltip="Copy to clipboard"], [data-turn-role="Model"] button[mattooltip*="Copy" i]').catch(() => []);
+  if (btns.length === 0) {
+    btns = await page.$$('button[mattooltip="Copy to clipboard"], button[mattooltip*="Copy" i]').catch(() => []);
+  }
   if (btns.length === 0) {
     log("  ⚠ コピーボタンが見つかりません");
     return "";
   }
 
-  // Click the LAST copy button (most recent model response code block)
+  // Click the LAST copy button (most recent model response)
   await btns[btns.length - 1].click().catch(() => {});
   log(`  📋 コピーボタンクリック (${btns.length}個中最後)`);
   await page.waitForTimeout(800);
@@ -761,13 +777,19 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   }
   await page.waitForTimeout(1500); // Extra settle time for DOM to finish rendering
 
-  // Ensure ms-autoscroll-container is scrolled to bottom before extraction.
-  // AI Studio uses this custom element as the virtual scroll host; window.scrollTo has no effect on it.
-  await page.evaluate(`(function() {
-    var c = document.querySelector('ms-autoscroll-container');
-    if (c) c.scrollTop = c.scrollHeight;
-  })()`).catch(() => {});
-  await page.waitForTimeout(500);
+  // Early extraction attempt: right after generation, response is still in viewport.
+  // Try to capture before any scroll-triggered virtualization.
+  const earlyText = await page.evaluate(`(function() {
+    var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+    if (containers.length === 0) return '';
+    var last = containers[containers.length - 1];
+    return (last.innerText || last.textContent || '').trim();
+  })()`).catch(() => "") as string;
+  if (earlyText.length > 500) {
+    log(`  ✅ early extraction: ${earlyText.length} chars`);
+    return cleanUiChrome(earlyText);
+  }
+  log(`  early extraction: ${earlyText.length} chars (too short, continuing)`);
 
   // Step 4: Primary — shadow DOM traversal
   const shadowText = await extractLastModelResponse(page);
