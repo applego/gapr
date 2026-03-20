@@ -530,8 +530,32 @@ async function extractLastModelResponse(page: Page): Promise<string> {
       }
       return result;
     }
-    var turns = Array.from(document.querySelectorAll('ms-chat-turn'));
-    if (turns.length === 0) return '';
+
+    // Try multiple selectors — AI Studio may rename components across versions
+    var selectors = [
+      'ms-chat-turn',
+      '.chat-turn',
+      '[data-turn-role="model"]',
+      'model-response',
+      '.model-response-text',
+      '.response-container',
+    ];
+    var turns = [];
+    for (var s = 0; s < selectors.length; s++) {
+      turns = Array.from(document.querySelectorAll(selectors[s]));
+      if (turns.length > 0) break;
+    }
+
+    if (turns.length === 0) {
+      // Fallback: look for markdown-rendered content areas (common in AI Studio)
+      var mdContainers = document.querySelectorAll('.markdown-content, .response-text, [class*="message-content"], [class*="model-response"]');
+      if (mdContainers.length > 0) {
+        var lastMd = mdContainers[mdContainers.length - 1];
+        return getDeepText(lastMd, 0);
+      }
+      return '';
+    }
+
     // After prompt submission and generation, the LAST turn is the model response.
     // For thinking-mode responses (Gemini with extended reasoning), the model uses 2 turns:
     //   second-to-last = "Thoughts" (reasoning, may be large), last = main response text.
@@ -547,12 +571,30 @@ async function extractLastModelResponse(page: Page): Promise<string> {
     return lastText;
   })()`).catch(() => "") as string;
 
-  // Clean up UI chrome artifacts (icon names, timestamps, etc.)
-  return (raw || "")
-    .replace(/^more_vert\n/gm, "")
-    .replace(/^Model\n/gm, "")
-    .replace(/^\d{1,2}:\d{2}\n/gm, "")
-    .trim();
+  // Clean up UI chrome artifacts (icon names, timestamps, Material icons, settings labels)
+  return cleanUiChrome(raw || "");
+}
+
+// Strip known AI Studio UI chrome patterns from extracted text.
+function cleanUiChrome(text: string): string {
+  const UI_CHROME_PATTERNS = [
+    /^more_vert\n/gm,
+    /^Model\n/gm,
+    /^\d{1,2}:\d{2}\n/gm,
+    // Material icon names
+    /^(key_off|widgets|close|add_circle|progress_activity|expand_more|reset_settings|code|stop_circle|content_copy|edit|check|arrow_drop_down|arrow_upward|arrow_downward|thumb_up|thumb_down|share|bookmark|flag|star|search|menu|settings|info|help|warning|error|delete|refresh)\n/gm,
+    // AI Studio sidebar labels
+    /^(Run settings|Get code|System instructions|No API Key|Temperature|Media resolution|Thinking level|Default|High|Structured outputs|Code execution|Function calling|Grounding with Google Search|URL context|Advanced settings|Tools|Safety settings|Source:)\n/gm,
+    // Model selector text
+    /^(Gemini\s+[\d.]+\s+\S+(\s+Preview)?|gemini-[\w.-]+)\n/gm,
+    /^(Our latest|Switch to a paid|Optional tone and style|Use Arrow Up)\b[^\n]*/gm,
+    /^google\n/gm,
+  ];
+  let cleaned = text;
+  for (const pat of UI_CHROME_PATTERNS) {
+    cleaned = cleaned.replace(pat, "");
+  }
+  return cleaned.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // Try to read the last model response via the Copy button + clipboard.
@@ -655,9 +697,20 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     return _interceptedResponse;
   }
 
-  // Step 6: Last resort — body text
-  log("  ⚠ フォールバック: body.innerText");
-  return await page.evaluate(() => document.body.innerText).catch(() => "");
+  // Step 6: Last resort — body text with aggressive UI chrome cleanup.
+  // Previous versions returned raw body.innerText which captured settings panels,
+  // sidebar labels, and other UI chrome instead of the actual model response.
+  log("  ⚠ フォールバック: body.innerText (UI chrome フィルタ適用)");
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  const cleaned = cleanUiChrome(bodyText);
+
+  // If cleaned text is <200 chars, it's almost certainly just residual UI chrome — not a real response.
+  // Return an explicit error marker so callers know extraction failed.
+  if (cleaned.length < 200) {
+    log(`  ❌ body.innerText after cleanup: ${cleaned.length} chars — extraction failed`);
+    return `[GAPR_EXTRACTION_FAILED] Shadow DOM, clipboard, API interception, and body.innerText all failed to capture the model response. The page may have changed structure. Raw body length: ${bodyText.length}, cleaned: ${cleaned.length}`;
+  }
+  return cleaned;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,13 +962,19 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     log("⏳ Gemini レスポンス待機中...");
     const response = await waitForResponse(page, sent ? 300 : 30);
 
-    if (response.length > 500) {
+    const isExtractionFailure = response.startsWith("[GAPR_EXTRACTION_FAILED]");
+    if (!isExtractionFailure && response.length > 500) {
       log(`✅ レスポンス: ${response.length} chars`);
       fs.writeFileSync(path.join(roundPath, "response.md"), response);
     } else {
-      log("⚠️  レスポンス短すぎ → ページ全文保存");
-      const full = await page.evaluate(() => document.body.innerText);
-      fs.writeFileSync(path.join(roundPath, "response-partial.md"), full);
+      log(`⚠️  レスポンス不十分 (${response.length} chars, extraction_failed=${isExtractionFailure}) → 診断情報保存`);
+      const full = await page.evaluate(() => document.body.innerText).catch(() => "");
+      const cleaned = cleanUiChrome(full);
+      // Save both raw (for debugging) and cleaned (for possible use)
+      fs.writeFileSync(path.join(roundPath, "response-partial.md"),
+        `<!-- GAPR: extraction incomplete. Cleaned body text below. Raw body: ${full.length} chars -->\n\n${cleaned}`);
+      fs.writeFileSync(path.join(roundPath, "response-debug.txt"),
+        `--- GAPR Extraction Debug ---\nwaitForResponse returned: ${response.length} chars\nisExtractionFailure: ${isExtractionFailure}\nRaw body.innerText: ${full.length} chars\nCleaned: ${cleaned.length} chars\n\n--- Raw Response ---\n${response}\n\n--- Cleaned Body ---\n${cleaned}`);
     }
 
     await page.screenshot({ path: path.join(roundPath, "screenshot.png"), fullPage: true });
