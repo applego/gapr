@@ -457,8 +457,11 @@ async function checkQuota(page: Page): Promise<boolean> {
 let _interceptedResponse = "";
 
 // Parse "text" fields from a raw Gemini API JSON payload.
+// Handles both REST API and $rpc/gRPC-web formats from AI Studio.
 function extractTextFromChunk(raw: string): string {
   const parts: string[] = [];
+
+  // Pattern 1: Standard REST API — "text": "content..."
   const textMatches = raw.matchAll(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
   for (const m of textMatches) {
     try {
@@ -467,6 +470,24 @@ function extractTextFromChunk(raw: string): string {
       parts.push(m[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"'));
     }
   }
+
+  // Pattern 2: gRPC-web / $rpc chunked — look for long strings (>50 chars)
+  // that look like natural language content (not JSON keys or URLs)
+  if (parts.join("").length < 100) {
+    const longStrings = raw.matchAll(/"((?:[^"\\]|\\.){50,})"/g);
+    for (const m of longStrings) {
+      try {
+        const decoded = JSON.parse(`"${m[1]}"`);
+        // Skip URLs, base64, and JSON-like strings
+        if (decoded.startsWith("http") || /^[A-Za-z0-9+/=]{50,}$/.test(decoded)) continue;
+        // Accept strings with spaces (natural language)
+        if ((decoded.match(/\s/g) || []).length > 5) {
+          parts.push(decoded);
+        }
+      } catch { /* skip */ }
+    }
+  }
+
   return parts.join("");
 }
 
@@ -496,7 +517,12 @@ function installResponseInterceptor(page: Page): void {
         url.includes("aiplatform.googleapis.com");
       if (!isGeminiApi) return;
 
-      const body = await response.text().catch(() => "");
+      // Try text() first, fall back to body() for streaming/binary responses
+      let body = await response.text().catch(() => "");
+      if (body.length < 100) {
+        const buf = await response.body().catch(() => null);
+        if (buf) body = buf.toString("utf-8");
+      }
       if (body.length < 100) return;
 
       const extracted = extractTextFromChunk(body);
@@ -595,9 +621,9 @@ function cleanUiChrome(text: string): string {
     /^Model\n/gm,
     /^\d{1,2}:\d{2}\n/gm,
     // Material icon names
-    /^(key_off|widgets|close|add_circle|progress_activity|expand_more|reset_settings|code|stop_circle|content_copy|edit|check|arrow_drop_down|arrow_upward|arrow_downward|thumb_up|thumb_down|share|bookmark|flag|star|search|menu|settings|info|help|warning|error|delete|refresh)\n/gm,
+    /^(key_off|widgets|close|add_circle|progress_activity|expand_more|reset_settings|code|stop_circle|content_copy|edit|check|arrow_drop_down|arrow_upward|arrow_downward|thumb_up|thumb_down|share|bookmark|flag|star|search|menu|settings|info|help|warning|error|delete|refresh|mic|stop|Stop)\n/gm,
     // AI Studio sidebar labels
-    /^(Run settings|Get code|System instructions|No API Key|Temperature|Media resolution|Thinking level|Default|High|Structured outputs|Code execution|Function calling|Grounding with Google Search|URL context|Advanced settings|Tools|Safety settings|Source:)\n/gm,
+    /^(Run settings|Get code|System instructions|No API Key|Temperature|Media resolution|Thinking level|Default|High|Structured outputs|Code execution|Function calling|Grounding with Google Search|Grounding with Google Maps|URL context|Advanced settings|Tools|Safety settings|Source:|Edit|Google Search)\n/gm,
     // Model selector text
     /^(Gemini\s+[\d.]+\s+\S+(\s+Preview)?|gemini-[\w.-]+)\n/gm,
     /^(Our latest|Switch to a paid|Optional tone and style|Use Arrow Up)\b[^\n]*/gm,
@@ -912,6 +938,16 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
         log(`🔗 ${newChatUrl} を開いています...`);
         await page.goto(newChatUrl, { waitUntil: "networkidle", timeout: 60000 });
         await page.waitForTimeout(3000);
+
+        // Auto-dismiss cookie consent banner if present
+        try {
+          const consentBtn = await page.$('button:has-text("同意する"), button:has-text("Accept"), button:has-text("I agree"), button[aria-label="Accept"]');
+          if (consentBtn) {
+            await consentBtn.click();
+            log("🍪 Cookie consent を自動で承認しました");
+            await page.waitForTimeout(1000);
+          }
+        } catch { /* consent not present */ }
       } else {
         await page.bringToFront();
         log(`🔗 既存タブをフォアグラウンドに: ${page.url()}`);
