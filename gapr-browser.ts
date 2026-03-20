@@ -592,7 +592,8 @@ async function extractLastModelResponse(page: Page): Promise<string> {
         log(`  turn-content: ${text.length} chars`);
         return cleanUiChrome(text);
       }
-      log(`  turn-content: too short (${text.length} chars), trying next`);
+      log(`  turn-content: too short (${text.length} chars), preview: "${text.trim().substring(0, 80).replace(/\n/g, "\\n")}"`);
+      log(`  turn-content count: ${count}`);
     }
   } catch { /* try next */ }
 
