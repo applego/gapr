@@ -742,40 +742,49 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     'button:has-text("Stop")',
   ].join(", ");
 
-  // Step 1: Wait for Stop button to appear (generation started)
-  log("  Step1: 生成開始待機...");
-  try {
-    await page.waitForSelector(stopSel, { state: "visible", timeout: 45000 });
-    log("  ▶ 生成開始");
-  } catch {
-    log("  ⚠ Stop ボタン未検出 (Flash など高速モデルは既に完了している場合がある)");
+  // Step 1: Wait for model turn to appear (ms-chat-turn >= 2) OR Stop button to appear.
+  // AI Studio Flash models complete very fast — Stop button may never appear.
+  // 45s timeout for Stop button is too long: model turn gets derendered by virtual scroll before we extract.
+  // New strategy: poll for EITHER condition with 3s max before moving on.
+  log("  Step1: 生成開始 or モデルターン出現待機...");
+  const step1Start = Date.now();
+  let generationStarted = false;
+  while (Date.now() - step1Start < 3000) {
+    const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
+    if (turnCount >= 2) {
+      log(`  ✅ ms-chat-turn x${turnCount} — 生成完了済み (fast model)`);
+      generationStarted = true;
+      break;
+    }
+    const stopVisible = await page.locator(stopSel).isVisible().catch(() => false);
+    if (stopVisible) {
+      log("  ▶ 生成開始 (Stop ボタン検出)");
+      generationStarted = true;
+      break;
+    }
+    await page.waitForTimeout(300);
+  }
+  if (!generationStarted) {
+    log("  ⚠ 3s以内にStop/ターン未検出 — 生成中と仮定して継続");
   }
 
-  // Step 2: Wait for Stop button to disappear (generation complete)
+  // Step 2: Wait for generation to complete (Stop button disappears or turns reach >=2)
   log("  Step2: 生成完了待機...");
-  try {
-    await page.waitForSelector(stopSel, { state: "hidden", timeout: maxSec * 1000 });
-    log("  ✅ 生成完了 (Stop 消滅)");
-  } catch {
-    log("  ⚠ タイムアウト");
-  }
-
-  // Step 3: Poll until model response turn appears in DOM (>=2 ms-chat-turn elements)
-  // AI Studio 2026-Q1+: ms-chat-turn elements are at document root (no shadow DOM).
-  // Use direct locator without pierce/ which fails when there are no shadow roots.
-  log("  Step3: モデルターン出現待機...");
-  const pollStart = Date.now();
-  const pollMax = 30000; // 30s max
-  while (Date.now() - pollStart < pollMax) {
+  const step2Start = Date.now();
+  while (Date.now() - step2Start < maxSec * 1000) {
     const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
     if (turnCount >= 2) {
       log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認`);
       break;
     }
+    const stopVisible = await page.locator(stopSel).isVisible().catch(() => false);
+    if (!stopVisible && generationStarted) {
+      log("  ✅ 生成完了 (Stop 消滅)");
+      break;
+    }
     await page.waitForTimeout(1000);
-    log(`  ... ターン待機中 (${Math.round((Date.now() - pollStart) / 1000)}s, turns=${turnCount})`);
   }
-  await page.waitForTimeout(1500); // Extra settle time for DOM to finish rendering
+  await page.waitForTimeout(800); // Short settle for DOM to finish rendering
 
   // Early extraction attempt: right after generation, response is still in viewport.
   // Try to capture before any scroll-triggered virtualization.
