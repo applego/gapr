@@ -804,19 +804,25 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   }
   await page.waitForTimeout(800); // Short settle for DOM to finish rendering
 
-  // Early extraction attempt: right after generation, response is still in viewport.
-  // Try to capture before any scroll-triggered virtualization.
-  const earlyText = await page.evaluate(`(function() {
-    var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
-    if (containers.length === 0) return '';
-    var last = containers[containers.length - 1];
-    return (last.innerText || last.textContent || '').trim();
-  })()`).catch(() => "") as string;
-  if (earlyText.length > 500) {
-    log(`  ✅ early extraction: ${earlyText.length} chars`);
-    return cleanUiChrome(earlyText);
+  // CRITICAL: AI Studio only fully renders virtual-scroll content AFTER saving the chat.
+  // The URL changes from /prompts/new_chat → /prompts/<ID> when saved.
+  // new_chat pages have ms-text-chunk content NOT rendered; saved prompt pages DO render.
+  // Strategy: wait up to 30s for URL change, then extract from the saved page.
+  log("  URL変化待機 (new_chat → /prompts/ID)...");
+  const initialUrl = page.url();
+  const urlWaitStart = Date.now();
+  while (Date.now() - urlWaitStart < 30000) {
+    const curUrl = page.url();
+    if (!curUrl.includes("new_chat") && curUrl.includes("/prompts/")) {
+      log(`  ✅ URL変化確認: ${curUrl.substring(curUrl.lastIndexOf("/") + 1)}`);
+      await page.waitForTimeout(1500); // Extra wait for virtual scroll to render after URL change
+      break;
+    }
+    await page.waitForTimeout(1000);
   }
-  log(`  early extraction: ${earlyText.length} chars (too short, continuing)`);
+  if (page.url().includes("new_chat")) {
+    log(`  ⚠ URL変化なし (new_chat のまま) — スクロール抽出を試みます`);
+  }
 
   // Step 4: Primary — shadow DOM traversal
   const shadowText = await extractLastModelResponse(page);
