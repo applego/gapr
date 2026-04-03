@@ -1074,6 +1074,51 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
         await page.waitForTimeout(1000);
       }
 
+      // Auto-enable Grounding with Google Search + URL context
+      try {
+        // Open "Run settings" panel if not already open
+        const runSettingsBtn = await page.$('button:has-text("Run settings"), [aria-label="Run settings"]');
+        if (runSettingsBtn) {
+          await runSettingsBtn.click();
+          await page.waitForTimeout(1000);
+        }
+        // Enable "Grounding with Google Search" toggle if OFF
+        const groundingToggle = await page.$('text="Grounding with Google Search"');
+        if (groundingToggle) {
+          const toggleParent = await groundingToggle.evaluateHandle(el => el.closest('[role="switch"], label, .toggle-container') || el.parentElement);
+          const isChecked = await toggleParent.evaluate(el => {
+            if (!el) return false;
+            const toggle = el.querySelector('[role="switch"], input[type="checkbox"]');
+            return toggle ? (toggle as HTMLInputElement).checked || toggle.getAttribute('aria-checked') === 'true' : false;
+          });
+          if (!isChecked) {
+            await groundingToggle.click();
+            log("🔍 Grounding with Google Search を ON にしました");
+            await page.waitForTimeout(500);
+          }
+        }
+        // Enable "URL context" toggle if OFF
+        const urlContextToggle = await page.$('text="URL context"');
+        if (urlContextToggle) {
+          const toggleParent2 = await urlContextToggle.evaluateHandle(el => el.closest('[role="switch"], label, .toggle-container') || el.parentElement);
+          const isChecked2 = await toggleParent2.evaluate(el => {
+            if (!el) return false;
+            const toggle = el.querySelector('[role="switch"], input[type="checkbox"]');
+            return toggle ? (toggle as HTMLInputElement).checked || toggle.getAttribute('aria-checked') === 'true' : false;
+          });
+          if (!isChecked2) {
+            await urlContextToggle.click();
+            log("🔗 URL context を ON にしました");
+            await page.waitForTimeout(500);
+          }
+        }
+        // Close settings panel (press Escape or click elsewhere)
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(500);
+      } catch (e) {
+        log(`⚠ Grounding 自動有効化スキップ: ${e}`);
+      }
+
       // ログイン確認
       const inputEl = await findInput(page);
       if (!inputEl) {
