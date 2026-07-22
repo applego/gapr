@@ -158,6 +158,15 @@ EOF
     [[ "$output" == *"5.2"* ]] || [[ "$output" == *"Thinking"* ]] || [[ "$output" == *"-m"* ]]
 }
 
+@test "run --dry-run: forwards browser model strategy" {
+    run "$APR_SCRIPT" run 1 --dry-run
+
+    log_test_output "$output"
+
+    assert_success
+    assert_output --partial '--browser-model-strategy "current"'
+}
+
 @test "run --dry-run: includes slug" {
     run "$APR_SCRIPT" run 1 --dry-run
 
