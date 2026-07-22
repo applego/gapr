@@ -17,7 +17,9 @@ teardown() {
 @test "acquire_lock: does not remove existing lock file on failure (fallback)" {
     # Create the reproduction script
     cat > "$TEST_DIR/lock_test.sh" << 'EOF'
-#!/bin/bash
+#!/usr/bin/env bash
+# NOTE: /bin/bash on macOS is 3.2, which cannot parse apr's `exec {FD}<>`
+# dynamic file descriptors (exits 127). Use env bash (4+) like apr itself.
 set -u
 
 # Source APR functions (strip main)
