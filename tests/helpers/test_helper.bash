@@ -79,6 +79,9 @@ setup_test_environment() {
 
     # Keep tests hermetic: never let preflight reach npm for Oracle auto-update
     export APR_ORACLE_NO_AUTOUPDATE=1
+
+    # Never let preflight kill processes on the test host
+    export APR_NO_ORACLE_REAP=1
     export CI=true
 
     # Disable update checks (unset, not =0, because script checks for empty)
