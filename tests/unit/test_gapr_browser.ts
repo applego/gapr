@@ -345,3 +345,51 @@ describe("nextRound", () => {
     assert.equal(nextRound(dir), 3);
   });
 });
+
+// ---------------------------------------------------------------------------
+// shouldCloseBlankTab (blank tab sweeper 判定ロジックの再実装テスト)
+// ---------------------------------------------------------------------------
+
+function shouldCloseBlankTab(
+  url: string,
+  blankSinceMs: number | null,
+  nowMs: number,
+  ttlMs: number,
+  isKeepPage: boolean,
+): boolean {
+  if (isKeepPage) return false;
+  if (url !== "about:blank" && url !== "") return false;
+  if (blankSinceMs === null) return false;
+  return nowMs - blankSinceMs >= ttlMs;
+}
+
+describe("shouldCloseBlankTab", () => {
+  const TTL = 5 * 60 * 1000;
+
+  test("TTL を超えて blank のままなら閉じる", () => {
+    assert.equal(shouldCloseBlankTab("about:blank", 0, TTL, TTL, false), true);
+  });
+
+  test("TTL 未満の blank は閉じない（並列 run の新タブ保護）", () => {
+    assert.equal(shouldCloseBlankTab("about:blank", 0, TTL - 1, TTL, false), false);
+  });
+
+  test("初回観測（blankSince=null）は閉じない", () => {
+    assert.equal(shouldCloseBlankTab("about:blank", null, TTL * 10, TTL, false), false);
+  });
+
+  test("keep-alive タブは絶対に閉じない", () => {
+    assert.equal(shouldCloseBlankTab("about:blank", 0, TTL * 10, TTL, true), false);
+  });
+
+  test("URL があるタブは閉じない", () => {
+    assert.equal(
+      shouldCloseBlankTab("https://aistudio.google.com/prompts/x", 0, TTL * 10, TTL, false),
+      false,
+    );
+  });
+
+  test("空 URL は blank 扱い", () => {
+    assert.equal(shouldCloseBlankTab("", 0, TTL, TTL, false), true);
+  });
+});
