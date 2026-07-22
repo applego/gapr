@@ -35,6 +35,26 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 ---
 
+## Merge Policy (main)
+
+**Owner (ytsun) approval, 2026-07-22**: This repo is a CLI tool repo (not a
+production-deploy trigger). Agents MAY merge PRs into `main` autonomously
+when ALL of the following hold:
+
+1. The change went through a PR (no direct pushes to `main` for code;
+   short-lived branch, immediate merge — trunk-based).
+2. CI is fully green (`CheckRun` and `StatusContext` both).
+3. Review threads are all resolved and no actionable review comments remain
+   (verify via GraphQL `reviewThreads`, not just `gh pr view`).
+4. The readiness/quiescence gate passes (e.g. `pr-review-loop` verdict `ok`,
+   per the `19-pr-review-autocheck` skill: mergeable=MERGEABLE, state CLEAN,
+   two consecutive clean observations).
+
+If any of these fail, stop and escalate to the owner instead of merging.
+Squash merge is the default. Delete the branch after merge.
+
+---
+
 ## Project Overview
 
 **APR (Automated Plan Reviser Pro)** is a CLI tool that automates iterative specification refinement using GPT Pro Extended Reasoning via Oracle browser automation.
