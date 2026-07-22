@@ -201,6 +201,60 @@ async function ensureDaemon(): Promise<void> {
 // Tab Manager
 // ---------------------------------------------------------------------------
 
+// --- Blank tab sweeper -------------------------------------------------------
+// Playwright の persistent context は起動時に about:blank を1枚持ち、
+// 中断された run も blank タブを残す。daemon 側で「一定時間 blank のまま」の
+// タブだけを閉じることで、並列 run が作った直後の新タブ（すぐ navigate される）
+// と競合せずに掃除できる。keepPage（daemon の keep-alive タブ）は対象外。
+
+const BLANK_TAB_TTL_MS = 5 * 60 * 1000;
+const BLANK_TAB_SWEEP_INTERVAL_MS = 60 * 1000;
+
+/** 掃除判定（純関数・テスト対象）: blank が ttl 以上継続していたら true */
+export function shouldCloseBlankTab(
+  url: string,
+  blankSinceMs: number | null,
+  nowMs: number,
+  ttlMs: number,
+  isKeepPage: boolean,
+): boolean {
+  if (isKeepPage) return false;
+  if (url !== "about:blank" && url !== "") return false;
+  if (blankSinceMs === null) return false; // 初回観測: まだ寿命判定しない
+  return nowMs - blankSinceMs >= ttlMs;
+}
+
+function startBlankTabSweeper(ctx: BrowserContext, keepPage: Page): NodeJS.Timeout {
+  const blankSince = new Map<Page, number>();
+  const timer = setInterval(async () => {
+    const now = Date.now();
+    for (const p of ctx.pages()) {
+      const url = p.url();
+      const isBlank = url === "about:blank" || url === "";
+      if (!isBlank) {
+        blankSince.delete(p);
+        continue;
+      }
+      const since = blankSince.get(p) ?? null;
+      if (shouldCloseBlankTab(url, since, now, BLANK_TAB_TTL_MS, p === keepPage)) {
+        try {
+          await p.close();
+          log("🧹 放置された about:blank タブを掃除しました");
+        } catch { /* already gone */ }
+        blankSince.delete(p);
+      } else if (since === null) {
+        blankSince.set(p, now);
+      }
+    }
+    // close 済み/GC 対象の参照を落とす
+    for (const p of [...blankSince.keys()]) {
+      if (!ctx.pages().includes(p)) blankSince.delete(p);
+    }
+  }, BLANK_TAB_SWEEP_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
+}
+
 /** sessionURL に対応するタブを返す。なければ新タブを作成。 */
 async function getOrCreateTab(ctx: BrowserContext, sessionUrl: string | null): Promise<Page> {
   if (sessionUrl) {
@@ -507,6 +561,9 @@ async function cmdDaemon(): Promise<void> {
   // 初期タブ
   const page = ctx.pages()[0] ?? await ctx.newPage();
   await page.goto("about:blank");
+
+  // 放置 blank タブの自動掃除（keep-alive タブは残す）
+  startBlankTabSweeper(ctx, page);
 
   // 終了シグナル
   const cleanup = async () => {
