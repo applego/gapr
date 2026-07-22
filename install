@@ -29,8 +29,8 @@ readonly EXIT_CHECKSUM_ERROR=3
 readonly EXIT_INSTALL_ERROR=4
 
 # Configuration
-readonly REPO_OWNER="Dicklesworthstone"
-readonly REPO_NAME="automated_plan_reviser_pro"
+readonly REPO_OWNER="applego"
+readonly REPO_NAME="gapr"
 readonly REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main"
 readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 readonly SCRIPT_NAME="gapr"
@@ -491,15 +491,19 @@ main() {
     $use_sudo mv "$tmp_file" "$script_path"
     $use_sudo chmod +x "$script_path"
 
-    # Also install gemini-helper.sh alongside gapr
+    # Install the required Gemini helper alongside gapr.
     local helper_path="${install_dir}/${HELPER_NAME}"
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [[ -f "${script_dir}/${HELPER_NAME}" ]]; then
-        log_step "Installing ${HELPER_NAME} to ${helper_path}..."
-        $use_sudo cp "${script_dir}/${HELPER_NAME}" "$helper_path"
-        $use_sudo chmod +x "$helper_path"
+    local helper_url helper_tmp
+    helper_url="${REPO_URL}/${HELPER_NAME}"
+    helper_tmp=$(mktemp)
+    log_step "Installing ${HELPER_NAME} to ${helper_path}..."
+    if ! download_file "$helper_url" "$helper_tmp"; then
+        log_error "Failed to download required helper from: $helper_url"
+        rm -f "$helper_tmp"
+        exit $EXIT_DOWNLOAD_ERROR
     fi
+    $use_sudo mv "$helper_tmp" "$helper_path"
+    $use_sudo chmod +x "$helper_path"
 
     # Add to PATH
     add_to_path "$install_dir" "$shell_config"

@@ -346,7 +346,10 @@ jobs:
           export APR_SKIP_VERIFY=1
 
           # Create modified installer for testing
-          sed 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/gapr" "$tmp_file"|g' install.sh > /tmp/test_install.sh
+          sed \
+            -e 's|download_file "$download_url" "$tmp_file"|cp "'"$(pwd)"'/gapr" "$tmp_file"|g' \
+            -e 's|download_file "$helper_url" "$helper_tmp"|cp "'"$(pwd)"'/gemini-helper.sh" "$helper_tmp"|g' \
+            install.sh > /tmp/test_install.sh
 
           # Run the modified installer
           bash /tmp/test_install.sh
