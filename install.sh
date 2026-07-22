@@ -446,7 +446,8 @@ main() {
     else
         # Latest from main branch
         download_url="${REPO_URL}/${SCRIPT_NAME}"
-        checksum_url="${REPO_URL}/apr.sha256"
+        # Verify the file we actually ship (gapr), not the legacy apr hash.
+        checksum_url="${REPO_URL}/${SCRIPT_NAME}.sha256"
         version_info="latest"
     fi
 
@@ -501,6 +502,20 @@ main() {
         log_error "Failed to download required helper from: $helper_url"
         rm -f "$helper_tmp"
         exit $EXIT_DOWNLOAD_ERROR
+    fi
+    # Optional helper checksum (skip gracefully when unavailable)
+    if [[ -z "${APR_SKIP_VERIFY:-}" ]]; then
+        local helper_checksum=""
+        helper_checksum=$(fetch_url "${helper_url}.sha256" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]') || true
+        if [[ -n "$helper_checksum" ]]; then
+            if ! verify_checksum "$helper_tmp" "$helper_checksum"; then
+                rm -f "$helper_tmp"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
+            log_info "Helper checksum verified"
+        else
+            log_dim "  (helper checksum not available for verification)"
+        fi
     fi
     $use_sudo mv "$helper_tmp" "$helper_path"
     $use_sudo chmod +x "$helper_path"

@@ -37,6 +37,24 @@ checksums:
 		echo "Run 'make update-checksums' to fix."; \
 		exit 1; \
 	fi
+	@gapr_hash=$$(sha256sum gapr | awk '{print $$1}'); \
+	stored_hash=$$(cat gapr.sha256 2>/dev/null | awk '{print $$1}' | tr -d '[:space:]'); \
+	if [ "$$gapr_hash" != "$$stored_hash" ]; then \
+		echo "ERROR: gapr.sha256 is out of date!"; \
+		echo "  Current: $$gapr_hash"; \
+		echo "  Stored:  $$stored_hash"; \
+		echo "Run 'make update-checksums' to fix."; \
+		exit 1; \
+	fi
+	@helper_hash=$$(sha256sum gemini-helper.sh | awk '{print $$1}'); \
+	stored_hash=$$(cat gemini-helper.sh.sha256 2>/dev/null | awk '{print $$1}' | tr -d '[:space:]'); \
+	if [ "$$helper_hash" != "$$stored_hash" ]; then \
+		echo "ERROR: gemini-helper.sh.sha256 is out of date!"; \
+		echo "  Current: $$helper_hash"; \
+		echo "  Stored:  $$stored_hash"; \
+		echo "Run 'make update-checksums' to fix."; \
+		exit 1; \
+	fi
 	@echo "Checksums OK!"
 
 # Update all checksum files
@@ -44,8 +62,10 @@ update-checksums:
 	@echo "Updating checksums..."
 	@sha256sum apr | awk '{print $$1}' > apr.sha256
 	@sha256sum install.sh | awk '{print $$1}' > install.sh.sha256
-	@sha256sum apr install.sh > checksums.txt
-	@sha256sum apr install.sh > CHECKSUMS.sha256
+	@sha256sum gapr | awk '{print $$1}' > gapr.sha256
+	@sha256sum gemini-helper.sh | awk '{print $$1}' > gemini-helper.sh.sha256
+	@sha256sum apr install.sh gapr gemini-helper.sh > checksums.txt
+	@sha256sum apr install.sh gapr gemini-helper.sh > CHECKSUMS.sha256
 	@echo "Updated checksums:"
 	@echo "  apr:        $$(cat apr.sha256)"
 	@echo "  install.sh: $$(cat install.sh.sha256)"
