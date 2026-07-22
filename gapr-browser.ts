@@ -57,7 +57,7 @@ import * as http from "http";
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MODEL = "gemini-2.5-pro-preview-05-06";
+const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
 const USER_DATA_DIR =
