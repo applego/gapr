@@ -76,6 +76,9 @@ setup_test_environment() {
     # Disable colors and gum for deterministic output
     export NO_COLOR=1
     export APR_NO_GUM=1
+
+    # Keep tests hermetic: never let preflight reach npm for Oracle auto-update
+    export APR_ORACLE_NO_AUTOUPDATE=1
     export CI=true
 
     # Disable update checks (unset, not =0, because script checks for empty)

@@ -59,6 +59,13 @@
 #   APR_ORACLE_STABLE_CYCLES     Required stable polling cycles (default: 12)
 #   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
 #
+#   Oracle Concurrency & Auth (parallel-safe browser runs):
+#   APR_ORACLE_REMOTE            host:port of a long-lived `oracle serve` daemon
+#   APR_ORACLE_REMOTE_TOKEN      Access token for the serve daemon
+#   APR_ORACLE_COPY_PROFILE      1 or <dir>: per-run clone of the signed-in profile
+#   APR_ORACLE_NO_AUTOUPDATE     Disable Oracle npm auto-update (set to 1)
+#   APR_ORACLE_UPDATE_INTERVAL_H Auto-update check interval in hours (default: 24)
+#
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
 set -euo pipefail
@@ -631,6 +638,112 @@ check_oracle() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Oracle Concurrency & Auth (parallel-safe browser runs)
+# -----------------------------------------------------------------------------
+# Parallel apr runs sharing ~/.oracle/browser-profile contend on Chrome's
+# profile lock, which forces throwaway fresh profiles and repeated ChatGPT
+# logins. Two escape hatches, resolved in priority order:
+#
+#   1. APR_ORACLE_REMOTE=host:port
+#      Route runs to a long-lived `oracle serve` daemon (single logged-in
+#      browser; sessions are multiplexed server-side, so N parallel runs
+#      never touch a local profile). APR_ORACLE_REMOTE_TOKEN supplies the
+#      daemon access token.
+#
+#   2. APR_ORACLE_COPY_PROFILE=1 | <dir>
+#      Per-run throwaway clone of the signed-in Chrome profile
+#      (default source: ~/.oracle/browser-profile). Heavier than serve
+#      (one Chrome per run) but needs no daemon.
+#
+# Values may also come from ${XDG_CONFIG_HOME:-~/.config}/apr/oracle-remote.env
+# so detached/robot runs need no per-shell exports. Environment variables
+# always win over the config file.
+
+APR_ORACLE_REMOTE_ENV_FILE="${APR_ORACLE_REMOTE_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/apr/oracle-remote.env}"
+APR_ORACLE_EXTRA_ARGS=()
+
+load_oracle_remote_env() {
+    [[ -f "$APR_ORACLE_REMOTE_ENV_FILE" ]] || return 0
+    local line key val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        case "$key" in
+            APR_ORACLE_REMOTE|APR_ORACLE_REMOTE_TOKEN|APR_ORACLE_COPY_PROFILE)
+                if [[ -z "${!key:-}" ]]; then
+                    printf -v "$key" '%s' "$val"
+                    export "${key?}"
+                fi
+                ;;
+        esac
+    done < "$APR_ORACLE_REMOTE_ENV_FILE"
+}
+
+# Populate APR_ORACLE_EXTRA_ARGS with concurrency/auth flags for Oracle.
+# Append with: ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"}
+build_oracle_concurrency_args() {
+    APR_ORACLE_EXTRA_ARGS=()
+    load_oracle_remote_env
+    if [[ -n "${APR_ORACLE_REMOTE:-}" ]]; then
+        APR_ORACLE_EXTRA_ARGS+=(--remote-host "$APR_ORACLE_REMOTE")
+        [[ -n "${APR_ORACLE_REMOTE_TOKEN:-}" ]] && APR_ORACLE_EXTRA_ARGS+=(--remote-token "$APR_ORACLE_REMOTE_TOKEN")
+        verbose "build_oracle_concurrency_args: remote serve at $APR_ORACLE_REMOTE"
+        return 0
+    fi
+    local copy="${APR_ORACLE_COPY_PROFILE:-}"
+    if [[ -n "$copy" && "$copy" != "0" && "$copy" != "false" ]]; then
+        local profile_dir="$HOME/.oracle/browser-profile"
+        [[ "$copy" != "1" && "$copy" != "true" ]] && profile_dir="$copy"
+        APR_ORACLE_EXTRA_ARGS+=(--copy-profile "$profile_dir")
+        verbose "build_oracle_concurrency_args: per-run profile clone from $profile_dir"
+    fi
+}
+
+# Keep a globally installed Oracle current (policy: always run the latest).
+# Throttled to once per APR_ORACLE_UPDATE_INTERVAL_H hours (default 24) via a
+# cache stamp. Opt out with APR_ORACLE_NO_AUTOUPDATE=1. Only applies when
+# `oracle` is a global npm binary; npx invocations already resolve latest.
+# Usage: maybe_autoupdate_oracle <installed_version>
+# The installed version is passed in (preflight already probed it) so this
+# adds no extra `oracle --version` invocation.
+maybe_autoupdate_oracle() {
+    local installed="${1:-}"
+    [[ -n "${APR_ORACLE_NO_AUTOUPDATE:-}" ]] && return 0
+    [[ -n "${CI:-}" ]] && return 0
+    [[ -n "$installed" ]] || return 0
+    [[ "${ORACLE_CMD[0]:-}" == "oracle" ]] || return 0
+    command -v npm &>/dev/null || return 0
+
+    local stamp="$APR_CACHE/oracle-update-check"
+    local interval_h="${APR_ORACLE_UPDATE_INTERVAL_H:-24}"
+    if [[ -f "$stamp" ]]; then
+        local now_s mtime_s age_s
+        now_s=$(date +%s)
+        mtime_s=$(stat -f %m "$stamp" 2>/dev/null || stat -c %Y "$stamp" 2>/dev/null || echo "$now_s")
+        age_s=$(( now_s - mtime_s ))
+        (( age_s < interval_h * 3600 )) && return 0
+    fi
+    mkdir -p "$APR_CACHE" 2>/dev/null || return 0
+    touch "$stamp" 2>/dev/null || true
+
+    local latest
+    latest=$(npm view @steipete/oracle version 2>/dev/null | head -1) || return 0
+    [[ -z "$latest" || "$installed" == "$latest" ]] && return 0
+
+    print_info "Updating Oracle ${installed} -> ${latest} (set APR_ORACLE_NO_AUTOUPDATE=1 to disable)..."
+    if npm install -g "@steipete/oracle@${latest}" >/dev/null 2>&1; then
+        print_success "Oracle updated to ${latest}"
+        # Fresh install: force feature re-detection and stability re-patching.
+        ORACLE_FEATURES_DETECTED=false
+        APR_ORACLE_PATCHED=false
+    else
+        print_warning "Oracle auto-update failed; continuing with ${installed}"
+    fi
+}
+
 oracle_detect_features() {
     local mode="${1:-full}" # "full" (default) or "fast"
 
@@ -696,6 +809,19 @@ oracle_detect_features() {
 
 ORACLE_ASSISTANT_RESPONSE_PATH=""
 ORACLE_BACKUP_PATH=""
+
+# Portable in-place sed: GNU sed uses `-i`, BSD/macOS sed requires `-i ''`.
+# Without this, the stability patch silently fails on macOS
+# ("transform strings are not the same length").
+sed_inplace() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$@"
+    else
+        local script="$1"
+        shift
+        sed -i '' "$script" "$@"
+    fi
+}
 
 find_oracle_assistant_response() {
     # Find Oracle's assistantResponse.js in the npm installation
@@ -763,6 +889,18 @@ patch_oracle_stability_thresholds() {
         return 1
     fi
 
+    # Oracle >= 0.16 exposes stability tuning natively via environment
+    # variables (ORACLE_TERMINAL_MIN_STABLE_MS) and no longer contains the
+    # legacy constants this sed patch targets. Detect that and configure via
+    # env instead of mutating the install — no patch, no warning.
+    if grep -q "ORACLE_TERMINAL_MIN_STABLE_MS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
+        export ORACLE_TERMINAL_MIN_STABLE_MS="${ORACLE_TERMINAL_MIN_STABLE_MS:-$APR_ORACLE_MIN_STABLE_MS}"
+        APR_ORACLE_PATCHED=true
+        verbose "patch_oracle_stability_thresholds: Oracle supports env-based stability config; skipping file patch"
+        print_success "Oracle stability configured via env (ORACLE_TERMINAL_MIN_STABLE_MS=${ORACLE_TERMINAL_MIN_STABLE_MS})"
+        return 0
+    fi
+
     # Check if file is already patched (look for our marker comment)
     if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
         verbose "patch_oracle_stability_thresholds: Already patched (marker found)"
@@ -791,22 +929,22 @@ patch_oracle_stability_thresholds() {
     # Patch 1: minStableMs in pollAssistantCompletion (line ~293)
     # Original: const minStableMs = shortAnswer ? 8000 : 1200;
     # Patched:  const minStableMs = shortAnswer ? 15000 : 30000; /* APR_PATCHED_STABILITY_THRESHOLDS */
-    sed -i "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_inplace "s|const minStableMs = shortAnswer ? 8000 : 1200;|const minStableMs = shortAnswer ? ${APR_ORACLE_SHORT_STABLE_MS} : ${APR_ORACLE_MIN_STABLE_MS}; /* APR_PATCHED_STABILITY_THRESHOLDS */|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
 
     # Patch 2: requiredStableCycles in pollAssistantCompletion (line ~291)
     # Original: const requiredStableCycles = shortAnswer ? 12 : 6;
     # Patched:  const requiredStableCycles = shortAnswer ? 18 : 12;
-    sed -i "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_inplace "s|const requiredStableCycles = shortAnswer ? 12 : 6;|const requiredStableCycles = shortAnswer ? 18 : ${APR_ORACLE_STABLE_CYCLES};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
 
     # Patch 3: settleWindowMs in waitForSettle (line ~551)
     # Original: const settleWindowMs = shortAnswer ? 12_000 : 5_000;
     # Patched:  const settleWindowMs = shortAnswer ? 15_000 : 30_000;
-    sed -i "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_inplace "s|const settleWindowMs = shortAnswer ? 12_000 : 5_000;|const settleWindowMs = shortAnswer ? 15_000 : ${APR_ORACLE_SETTLE_WINDOW_MS};|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
 
     # Patch 4: stableTarget in waitForSettle (line ~557)
     # Original: const stableTarget = shortAnswer ? 6 : 3;
     # Patched:  const stableTarget = shortAnswer ? 12 : 6;
-    sed -i "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
+    sed_inplace "s|const stableTarget = shortAnswer ? 6 : 3;|const stableTarget = shortAnswer ? 12 : 6;|g" "$ORACLE_ASSISTANT_RESPONSE_PATH"
 
     # Verify patch was applied
     if grep -q "APR_PATCHED_STABILITY_THRESHOLDS" "$ORACLE_ASSISTANT_RESPONSE_PATH" 2>/dev/null; then
@@ -882,6 +1020,9 @@ preflight_check() {
         print_warning "Could not verify Oracle version (may still work)"
         has_warnings=true
     fi
+
+    # Keep Oracle at the latest release (throttled; APR_ORACLE_NO_AUTOUPDATE=1 to skip)
+    maybe_autoupdate_oracle "$oracle_version" || true
 
     # Detect Oracle feature support (--notify may not exist in older versions)
     oracle_detect_features || true
@@ -3256,6 +3397,13 @@ run_round() {
     [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
     [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
     [[ -n "$browser_model_strategy" ]] && oracle_args+=(--browser-model-strategy "$browser_model_strategy")
+    if [[ "$manual_login" == "true" ]]; then
+        # Login runs must use the local persistent profile so the session sticks.
+        verbose "manual login run: skipping oracle concurrency args"
+    else
+        build_oracle_concurrency_args
+        oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
+    fi
     oracle_args+=(-p "$prompt")
 
     verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
@@ -5790,6 +5938,8 @@ robot_run() {
 
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
     [[ -n "$browser_model_strategy" ]] && oracle_args+=(--browser-model-strategy "$browser_model_strategy")
+    build_oracle_concurrency_args
+    oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
 
     verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
     verbose "robot_run output_file: $output_file"
@@ -6440,6 +6590,9 @@ show_help() {
         gum style --faint "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
         gum style --faint "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
         gum style --faint "  APR_NO_GUM           Disable gum even if available" >&2
+        gum style --faint "  APR_ORACLE_REMOTE    host:port of an \`oracle serve\` daemon (parallel-safe)" >&2
+        gum style --faint "  APR_ORACLE_COPY_PROFILE  1 or <dir>: per-run signed-in profile clone" >&2
+        gum style --faint "  APR_ORACLE_NO_AUTOUPDATE Disable Oracle npm auto-update (set to 1)" >&2
         gum style --faint "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
 
@@ -6545,6 +6698,9 @@ show_help() {
         echo "  APR_MAX_RETRIES      Max retry attempts (default: 3)" >&2
         echo "  APR_INITIAL_BACKOFF  Initial retry backoff in seconds (default: 10)" >&2
         echo "  APR_NO_GUM           Disable gum even if available" >&2
+        echo "  APR_ORACLE_REMOTE    host:port of an \`oracle serve\` daemon (parallel-safe)" >&2
+        echo "  APR_ORACLE_COPY_PROFILE  1 or <dir>: per-run signed-in profile clone" >&2
+        echo "  APR_ORACLE_NO_AUTOUPDATE Disable Oracle npm auto-update (set to 1)" >&2
         echo "  NO_COLOR             Disable colored output" >&2
         echo "" >&2
         echo -e "${BOLD}${YELLOW}EXAMPLES${NC}" >&2

@@ -6,13 +6,22 @@
 
 set -euo pipefail
 
-# gapr リポジトリのパス（変更時は GAPR_REPO_DIR 環境変数で上書き可能）
-GAPR_REPO_DIR="${GAPR_REPO_DIR:-$HOME/Documents/workspace_dev/gapr}"
+# gapr リポジトリのパス。優先順: GAPR_REPO_DIR 環境変数 > 既知の候補パス。
+# PC 固有の絶対パスを固定しない（複数 Mac SSOT 運用のため）。
+if [[ -z "${GAPR_REPO_DIR:-}" ]]; then
+  for candidate in "$HOME/repos/gapr" "$HOME/Documents/workspace_dev/gapr" "$HOME/dp/gapr"; do
+    if [[ -f "${candidate}/gapr-browser.ts" ]]; then
+      GAPR_REPO_DIR="$candidate"
+      break
+    fi
+  done
+fi
+GAPR_REPO_DIR="${GAPR_REPO_DIR:-}"
 TS_SCRIPT="${GAPR_REPO_DIR}/gapr-browser.ts"
 TSX_BIN="${GAPR_REPO_DIR}/node_modules/.bin/tsx"
 
-if [[ ! -f "$TS_SCRIPT" ]]; then
-  echo "❌ gapr-browser.ts が見つかりません: $TS_SCRIPT" >&2
+if [[ -z "$GAPR_REPO_DIR" || ! -f "$TS_SCRIPT" ]]; then
+  echo "❌ gapr リポジトリが見つかりません。GAPR_REPO_DIR を設定してください（例: export GAPR_REPO_DIR=~/repos/gapr）" >&2
   exit 1
 fi
 
