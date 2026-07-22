@@ -60,11 +60,15 @@
 #   APR_NO_ORACLE_PATCH          Disable Oracle patching (set to 1)
 #
 #   Oracle Concurrency & Auth (parallel-safe browser runs):
-#   APR_ORACLE_REMOTE            host:port of a long-lived `oracle serve` daemon
-#   APR_ORACLE_REMOTE_TOKEN      Access token for the serve daemon
+#   APR_ORACLE_REMOTE            `oracle serve` endpoint(s); comma-separated pool
+#                                ("h1:p1,h2:p2") enables true parallel runs with
+#                                probe + slot spread + failover on retry
+#   APR_ORACLE_REMOTE_TOKEN      Access token for the serve daemon(s)
 #   APR_ORACLE_COPY_PROFILE      1 or <dir>: per-run clone of the signed-in profile
+#   APR_ORACLE_SLOT_SEED         Override the pool slot seed (default: PID)
 #   APR_ORACLE_NO_AUTOUPDATE     Disable Oracle npm auto-update (set to 1)
 #   APR_ORACLE_UPDATE_INTERVAL_H Auto-update check interval in hours (default: 24)
+#   APR_NO_ORACLE_REAP           Disable orphan Chrome reaping in preflight (set to 1)
 #
 # More info: https://github.com/Dicklesworthstone/automated_plan_reviser_pro
 
@@ -683,15 +687,80 @@ load_oracle_remote_env() {
 }
 
 # Populate APR_ORACLE_EXTRA_ARGS with concurrency/auth flags for Oracle.
+# -----------------------------------------------------------------------------
+# Oracle serve pool (parallel apr across multiple single-flight daemons)
+# -----------------------------------------------------------------------------
+# `oracle serve` is single-flight (a second POST /runs gets HTTP 409 "busy"),
+# so ONE daemon serializes reviews. For true parallelism, APR_ORACLE_REMOTE
+# accepts a comma-separated pool ("h1:p1,h2:p2,..."). Each run probes the
+# pool, spreads across alive endpoints by a slot hash, and rotates to the
+# next endpoint when a retry is needed (busy daemon or dead connection).
+
+APR_ORACLE_REMOTE_POOL=()
+APR_ORACLE_REMOTE_INDEX=0
+
+# Liveness probe for one endpoint (overridable in tests).
+apr_probe_oracle_remote() {
+    local endpoint="$1"
+    command -v curl &>/dev/null || return 0  # cannot probe -> assume alive
+    curl -s --max-time 2 "http://${endpoint}/status" 2>/dev/null | grep -q '"ok"'
+}
+
+# Parse APR_ORACLE_REMOTE, probe candidates, fill APR_ORACLE_REMOTE_POOL and
+# pick a starting slot from a seed so parallel runs spread across the pool.
+# Returns 1 when no endpoint is alive.
+apr_select_oracle_remote() {
+    local seed="${1:-$$}"
+    APR_ORACLE_REMOTE_POOL=()
+    APR_ORACLE_REMOTE_INDEX=0
+    local raw="${APR_ORACLE_REMOTE:-}"
+    [[ -n "$raw" ]] || return 1
+    local -a candidates=()
+    IFS=',' read -r -a candidates <<< "$raw"
+    local ep
+    for ep in ${candidates[@]+"${candidates[@]}"}; do
+        ep="${ep// /}"
+        [[ -n "$ep" ]] || continue
+        if apr_probe_oracle_remote "$ep"; then
+            APR_ORACLE_REMOTE_POOL+=("$ep")
+        else
+            verbose "apr_select_oracle_remote: endpoint $ep unreachable; skipping"
+        fi
+    done
+    [[ ${#APR_ORACLE_REMOTE_POOL[@]} -gt 0 ]] || return 1
+    local hash
+    hash=$(printf '%s' "$seed" | cksum | awk '{print $1}')
+    APR_ORACLE_REMOTE_INDEX=$(( hash % ${#APR_ORACLE_REMOTE_POOL[@]} ))
+    return 0
+}
+
+apr_current_oracle_remote() {
+    [[ ${#APR_ORACLE_REMOTE_POOL[@]} -gt 0 ]] || return 1
+    echo "${APR_ORACLE_REMOTE_POOL[$(( APR_ORACLE_REMOTE_INDEX % ${#APR_ORACLE_REMOTE_POOL[@]} ))]}"
+}
+
+# Advance to the next pool endpoint (returns 1 when there is nothing to rotate to).
+apr_rotate_oracle_remote() {
+    [[ ${#APR_ORACLE_REMOTE_POOL[@]} -gt 1 ]] || return 1
+    APR_ORACLE_REMOTE_INDEX=$(( (APR_ORACLE_REMOTE_INDEX + 1) % ${#APR_ORACLE_REMOTE_POOL[@]} ))
+    verbose "apr_rotate_oracle_remote: now $(apr_current_oracle_remote)"
+    return 0
+}
+
 # Append with: ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"}
 build_oracle_concurrency_args() {
     APR_ORACLE_EXTRA_ARGS=()
     load_oracle_remote_env
     if [[ -n "${APR_ORACLE_REMOTE:-}" ]]; then
-        APR_ORACLE_EXTRA_ARGS+=(--remote-host "$APR_ORACLE_REMOTE")
-        [[ -n "${APR_ORACLE_REMOTE_TOKEN:-}" ]] && APR_ORACLE_EXTRA_ARGS+=(--remote-token "$APR_ORACLE_REMOTE_TOKEN")
-        verbose "build_oracle_concurrency_args: remote serve at $APR_ORACLE_REMOTE"
-        return 0
+        if apr_select_oracle_remote "${APR_ORACLE_SLOT_SEED:-$$}"; then
+            local endpoint
+            endpoint=$(apr_current_oracle_remote)
+            APR_ORACLE_EXTRA_ARGS+=(--remote-host "$endpoint")
+            [[ -n "${APR_ORACLE_REMOTE_TOKEN:-}" ]] && APR_ORACLE_EXTRA_ARGS+=(--remote-token "$APR_ORACLE_REMOTE_TOKEN")
+            verbose "build_oracle_concurrency_args: remote serve at $endpoint (pool size ${#APR_ORACLE_REMOTE_POOL[@]})"
+            return 0
+        fi
+        print_warning "No reachable oracle serve endpoint in APR_ORACLE_REMOTE=$APR_ORACLE_REMOTE; falling back to local browser"
     fi
     local copy="${APR_ORACLE_COPY_PROFILE:-}"
     if [[ -n "$copy" && "$copy" != "0" && "$copy" != "false" ]]; then
@@ -700,6 +769,44 @@ build_oracle_concurrency_args() {
         APR_ORACLE_EXTRA_ARGS+=(--copy-profile "$profile_dir")
         verbose "build_oracle_concurrency_args: per-run profile clone from $profile_dir"
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Orphaned oracle Chrome reaper (self-healing preflight)
+# -----------------------------------------------------------------------------
+# Crashed or interrupted oracle runs leave Chrome instances behind (PPID=1)
+# holding stale login state. They are NOT safe to reuse (undefined UI state),
+# so apr reaps them on preflight instead. Managed daemons are excluded:
+# a serve daemon's Chrome has the live serve process as its parent, and
+# profiles under ~/.oracle/profiles/ are skipped as an extra guard.
+
+# Pure parser (testable): reads `pid ppid command` lines on stdin and prints
+# PIDs of orphaned oracle-spawned Chrome main processes.
+apr_orphan_oracle_chrome_pids() {
+    local exclude="${1:-/.oracle/profiles/}"
+    awk -v exclude="$exclude" '
+        $2 == 1 &&
+        index($0, "user-data-dir=") > 0 &&
+        (index($0, "/.oracle/") > 0 || $0 ~ /user-data-dir=[^ ]*\/oracle-[A-Za-z0-9]/) &&
+        index($0, "--type=") == 0 {
+            if (exclude != "" && index($0, exclude) > 0) next
+            print $1
+        }'
+}
+
+# Reap orphans (opt out: APR_NO_ORACLE_REAP=1).
+reap_orphan_oracle_chrome() {
+    [[ -n "${APR_NO_ORACLE_REAP:-}" ]] && return 0
+    local pids
+    pids=$(ps -ax -o pid=,ppid=,command= 2>/dev/null | apr_orphan_oracle_chrome_pids) || true
+    [[ -n "$pids" ]] || return 0
+    local pid
+    for pid in $pids; do
+        verbose "reap_orphan_oracle_chrome: terminating orphan Chrome $pid"
+        kill "$pid" 2>/dev/null || true
+    done
+    print_dim "Reaped orphaned oracle Chrome instance(s): $(echo "$pids" | tr '\n' ' ')"
+    return 0
 }
 
 # Keep a globally installed Oracle current (policy: always run the latest).
@@ -1024,6 +1131,10 @@ preflight_check() {
     # Keep Oracle at the latest release (throttled; APR_ORACLE_NO_AUTOUPDATE=1 to skip)
     maybe_autoupdate_oracle "$oracle_version" || true
 
+    # Self-heal: reap orphaned oracle Chrome instances left by crashed runs
+    # (stale login state; not safe to reuse). Opt out: APR_NO_ORACLE_REAP=1
+    reap_orphan_oracle_chrome || true
+
     # Detect Oracle feature support (--notify may not exist in older versions)
     oracle_detect_features || true
 
@@ -1241,6 +1352,28 @@ run_oracle_with_retry() {
         # For now, we'll retry on any non-zero exit if we have attempts left
         if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
             print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
+
+            # Serve pool failover: a single-flight daemon may be busy (409) or
+            # gone; rotate the --remote-host value to the next alive endpoint
+            # before retrying so the retry lands on a different daemon.
+            if [[ ${#APR_ORACLE_REMOTE_POOL[@]} -gt 1 ]] && apr_rotate_oracle_remote; then
+                local next_endpoint
+                next_endpoint=$(apr_current_oracle_remote)
+                local -a rewritten=()
+                local prev_arg=""
+                local cur_arg
+                for cur_arg in "$@"; do
+                    if [[ "$prev_arg" == "--remote-host" ]]; then
+                        rewritten+=("$next_endpoint")
+                    else
+                        rewritten+=("$cur_arg")
+                    fi
+                    prev_arg="$cur_arg"
+                done
+                set -- ${rewritten[@]+"${rewritten[@]}"}
+                print_info "Failing over to oracle serve endpoint: $next_endpoint"
+            fi
+
             print_info "Retrying in ${backoff}s..."
             sleep "$backoff"
             # Exponential backoff: 10s, 30s, 90s
