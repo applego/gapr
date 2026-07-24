@@ -67,7 +67,7 @@ let _userDataDir =
 
 let _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
 let _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
-let _daemonPidFile = "/tmp/gapr-daemon.pid";
+let _daemonPidFile = process.env.GAPR_DAEMON_PID_FILE ?? "/tmp/gapr-daemon.pid";
 
 /** Switch active account. index=0 → default profile/port, index>0 → named profile on port 9322+index. */
 function resolveAccount(name: string, index: number): void {
@@ -75,7 +75,7 @@ function resolveAccount(name: string, index: number): void {
     _userDataDir = process.env.CHROME__userDataDir ?? path.join(process.env.HOME!, ".gapr-playwright-profile");
     _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
     _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
-    _daemonPidFile = "/tmp/gapr-daemon.pid";
+    _daemonPidFile = process.env.GAPR_DAEMON_PID_FILE ?? "/tmp/gapr-daemon.pid";
   } else {
     _userDataDir = path.join(process.env.HOME!, `.gapr-playwright-profile-${name}`);
     _cdpPort = 9322 + index;
@@ -205,7 +205,18 @@ async function ensureDaemon(): Promise<void> {
     process.execPath,
     // tsx v4+ doesn't export ./dist/cli.mjs; resolve via package.json then build path
     [require("path").join(require("path").dirname(require.resolve("tsx/package.json")), "dist", "cli.mjs"), __filename, "daemon"],
-    { detached: true, stdio: "ignore", env: { ...process.env, GAPR_DAEMON_MODE: "1" } }
+    {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        GAPR_DAEMON_MODE: "1",
+        CHROME__userDataDir: _userDataDir,
+        GAPR__cdpPort: String(_cdpPort),
+        GAPR_CDP_FILE: _cdpEndpointFile,
+        GAPR_DAEMON_PID_FILE: _daemonPidFile,
+      },
+    }
   );
   child.unref();
 
@@ -804,7 +815,7 @@ async function tryReadViaClipboard(page: Page): Promise<string> {
   return text;
 }
 
-async function waitForResponse(page: Page, maxSec: number): Promise<string> {
+async function waitForResponse(page: Page, maxSec: number, baselineTurnCount: number): Promise<string> {
   // AI Studio renders model responses in shadow DOM — document.body.innerText won't capture them.
   // Strategy:
   //   1. Wait for Stop button to appear/disappear (generation lifecycle)
@@ -818,7 +829,7 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     'button:has-text("Stop")',
   ].join(", ");
 
-  // Step 1: Wait for model turn to appear (ms-chat-turn >= 2) OR Stop button to appear.
+  // Step 1: Wait for a turn newer than the pre-send baseline OR Stop button to appear.
   // AI Studio Flash models complete very fast — Stop button may never appear.
   // 45s timeout for Stop button is too long: model turn gets derendered by virtual scroll before we extract.
   // New strategy: poll for EITHER condition with 3s max before moving on.
@@ -827,8 +838,8 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
   let generationStarted = false;
   while (Date.now() - step1Start < 3000) {
     const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
-    if (turnCount >= 2) {
-      log(`  ✅ ms-chat-turn x${turnCount} — 生成完了済み (fast model)`);
+    if (turnCount > baselineTurnCount) {
+      log(`  ✅ ms-chat-turn x${turnCount} — 新規モデルターン検出`);
       generationStarted = true;
       break;
     }
@@ -844,19 +855,29 @@ async function waitForResponse(page: Page, maxSec: number): Promise<string> {
     log("  ⚠ 3s以内にStop/ターン未検出 — 生成中と仮定して継続");
   }
 
-  // Step 2: Wait for generation to complete (Stop button disappears or turns reach >=2)
+  // Step 2: Wait for generation to complete. A new turn can exist while it is still streaming,
+  // so turn count alone is not a completion signal.
   log("  Step2: 生成完了待機...");
   const step2Start = Date.now();
+  let stopObserved = false;
+  let previousLength = -1;
+  let stableLengthPolls = 0;
   while (Date.now() - step2Start < maxSec * 1000) {
     const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
-    if (turnCount >= 2) {
-      log(`  ✅ ms-chat-turn x${turnCount} — モデルターン確認`);
-      break;
-    }
     const stopVisible = await page.locator(stopSel).isVisible().catch(() => false);
-    if (!stopVisible && generationStarted) {
+    if (stopVisible) stopObserved = true;
+    if (stopObserved && !stopVisible) {
       log("  ✅ 生成完了 (Stop 消滅)");
       break;
+    }
+    if (!stopObserved && turnCount > baselineTurnCount) {
+      const responseLength = await page.locator("ms-chat-turn").last().evaluate((node) => node.textContent?.length ?? 0).catch(() => 0);
+      stableLengthPolls = responseLength > 0 && responseLength === previousLength ? stableLengthPolls + 1 : 0;
+      previousLength = responseLength;
+      if (stableLengthPolls >= 2) {
+        log(`  ✅ 新規モデルターン安定 (${responseLength} chars)`);
+        break;
+      }
     }
     await page.waitForTimeout(1000);
   }
@@ -1095,6 +1116,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
   let ctx!: Awaited<ReturnType<typeof connectToDaemon>>;
   let page!: import("playwright").Page;
   let sentResult = false; // hoisted out of while so response capture can use it after break
+  let pageBaselineTurnCount = 0;
 
   while (accountIdx < accountsList.length) {
     const acctName = accountsList[accountIdx];
@@ -1192,7 +1214,8 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
       // Uses page.on("response") — non-intercepting, won't crash on streaming responses.
       installResponseInterceptor(page);
 
-      log("📋 プロンプト入力中...");
+      const baselineTurnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
+      log(`📋 プロンプト入力中... (既存ターン: ${baselineTurnCount})`);
       sentResult = await typeAndSend(page, inputEl, prompt);
       if (!sentResult) {
         log("⚠️  送信不明");
@@ -1215,6 +1238,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
         logAlways("❌ 全アカウントのクォータ超過。後で再試行してください。");
         process.exit(10);
       }
+      pageBaselineTurnCount = baselineTurnCount;
       break; // quota OK → proceed (response capture runs after while loop)
 
     } catch (err) {
@@ -1239,7 +1263,7 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     await page.screenshot({ path: path.join(roundPath, "post-send.png"), fullPage: true });
 
     log("⏳ Gemini レスポンス待機中...");
-    const response = await waitForResponse(page, sentResult ? 300 : 30);
+    const response = await waitForResponse(page, sentResult ? 300 : 30, pageBaselineTurnCount);
 
     const isExtractionFailure = response.startsWith("[GAPR_EXTRACTION_FAILED]");
     const isAiStudioError = response.startsWith("[GAPR_AISTUDIO_ERROR");

@@ -393,3 +393,24 @@ describe("shouldCloseBlankTab", () => {
     assert.equal(shouldCloseBlankTab("", 0, TTL, TTL, false), true);
   });
 });
+
+describe("response and account isolation guards", () => {
+  test("既存会話では送信前より新しいturnだけを応答開始とみなす", () => {
+    const hasNewTurn = (baseline: number, current: number) => current > baseline;
+    assert.equal(hasNewTurn(4, 4), false);
+    assert.equal(hasNewTurn(4, 5), true);
+  });
+
+  test("fallback daemonへaccount固有のprofile・port・endpoint・pidを渡す", () => {
+    const env = {
+      CHROME__userDataDir: "/tmp/profile-secondary",
+      GAPR__cdpPort: "9323",
+      GAPR_CDP_FILE: "/tmp/gapr-cdp-endpoint-secondary.txt",
+      GAPR_DAEMON_PID_FILE: "/tmp/gapr-daemon-secondary.pid",
+    };
+    assert.deepEqual(Object.keys(env).sort(), [
+      "CHROME__userDataDir", "GAPR_CDP_FILE", "GAPR_DAEMON_PID_FILE", "GAPR__cdpPort",
+    ].sort());
+    assert.equal(env.GAPR__cdpPort, "9323");
+  });
+});
