@@ -60,13 +60,29 @@ import * as http from "http";
 const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
-const USER_DATA_DIR =
-  process.env.CHROME_USER_DATA_DIR ??
+// Account-specific settings — mutable so multi-account fallback can switch at runtime
+let _userDataDir =
+  process.env.CHROME__userDataDir ??
   path.join(process.env.HOME!, ".gapr-playwright-profile");
 
-const CDP_PORT = parseInt(process.env.GAPR_CDP_PORT ?? "9322");
-const CDP_ENDPOINT_FILE = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
-const DAEMON_PID_FILE = "/tmp/gapr-daemon.pid";
+let _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
+let _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
+let _daemonPidFile = process.env.GAPR_DAEMON_PID_FILE ?? "/tmp/gapr-daemon.pid";
+
+/** Switch active account. index=0 → default profile/port, index>0 → named profile on port 9322+index. */
+function resolveAccount(name: string, index: number): void {
+  if (index === 0) {
+    _userDataDir = process.env.CHROME__userDataDir ?? path.join(process.env.HOME!, ".gapr-playwright-profile");
+    _cdpPort = parseInt(process.env.GAPR__cdpPort ?? "9322");
+    _cdpEndpointFile = process.env.GAPR_CDP_FILE ?? "/tmp/gapr-cdp-endpoint.txt";
+    _daemonPidFile = process.env.GAPR_DAEMON_PID_FILE ?? "/tmp/gapr-daemon.pid";
+  } else {
+    _userDataDir = path.join(process.env.HOME!, `.gapr-playwright-profile-${name}`);
+    _cdpPort = 9322 + index;
+    _cdpEndpointFile = `/tmp/gapr-cdp-endpoint-${name}.txt`;
+    _daemonPidFile = `/tmp/gapr-daemon-${name}.pid`;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parsing
@@ -81,6 +97,7 @@ interface CliArgs {
   dryRun: boolean;
   includeImpl: boolean;
   quiet: boolean;
+  account?: string;  // explicit account name (skips to that account in the fallback list)
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -94,6 +111,7 @@ function parseArgs(argv: string[]): CliArgs {
   let includeImpl = false;
   let quiet = false;
 
+  let account: string | undefined;
   let i = 0;
   while (i < args.length) {
     const a = args[i];
@@ -108,7 +126,7 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (a === "--quiet" || a === "-q") {
       quiet = true;
     } else if (a === "--version") {
-      console.log("gapr 1.1.0 (Playwright CDP edition)");
+      console.log("gapr 2.2.8 (Playwright CDP edition)");
       process.exit(0);
     } else if (a.startsWith("--workflow=")) {
       workflow = a.split("=")[1];
@@ -118,12 +136,16 @@ function parseArgs(argv: string[]): CliArgs {
       model = a.split("=")[1];
     } else if (a === "--model" && args[i + 1]) {
       model = args[++i];
+    } else if (a.startsWith("--account=")) {
+      account = a.split("=")[1];
+    } else if (a === "--account" && args[i + 1]) {
+      account = args[++i];
     } else if (/^\d+$/.test(a)) {
       round = parseInt(a);
     }
     i++;
   }
-  return { command, round, workflow, forceNew, model, dryRun, includeImpl, quiet };
+  return { command, round, workflow, forceNew, model, dryRun, includeImpl, quiet, account };
 }
 
 // ---------------------------------------------------------------------------
@@ -154,20 +176,20 @@ async function fetchWsEndpoint(port: number): Promise<string> {
 }
 
 async function isDaemonRunning(): Promise<boolean> {
-  if (!fs.existsSync(CDP_ENDPOINT_FILE)) return false;
+  if (!fs.existsSync(_cdpEndpointFile)) return false;
   try {
-    await fetchWsEndpoint(CDP_PORT);
+    await fetchWsEndpoint(_cdpPort);
     return true;
   } catch {
     // endpoint file 残ってるが Chrome 死んでる → クリーンアップ
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
     return false;
   }
 }
 
 async function connectToDaemon(): Promise<BrowserContext> {
-  const wsUrl = fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim();
+  const wsUrl = fs.readFileSync(_cdpEndpointFile, "utf-8").trim();
   const browser = await chromium.connectOverCDP(wsUrl, { timeout: 10000 });
   const ctx = browser.contexts()[0];
   if (!ctx) throw new Error("CDP context が見つかりません");
@@ -181,8 +203,20 @@ async function ensureDaemon(): Promise<void> {
   log("🚀 daemon が未起動のため自動起動します...");
   const child = require("child_process").spawn(
     process.execPath,
-    [require.resolve("tsx/dist/cli.mjs"), __filename, "daemon"],
-    { detached: true, stdio: "ignore", env: { ...process.env, GAPR_DAEMON_MODE: "1" } }
+    // tsx v4+ doesn't export ./dist/cli.mjs; resolve via package.json then build path
+    [require("path").join(require("path").dirname(require.resolve("tsx/package.json")), "dist", "cli.mjs"), __filename, "daemon"],
+    {
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        GAPR_DAEMON_MODE: "1",
+        CHROME__userDataDir: _userDataDir,
+        GAPR__cdpPort: String(_cdpPort),
+        GAPR_CDP_FILE: _cdpEndpointFile,
+        GAPR_DAEMON_PID_FILE: _daemonPidFile,
+      },
+    }
   );
   child.unref();
 
@@ -292,6 +326,7 @@ interface WorkflowConfig {
   documents: { readme?: string; spec?: string; implementation?: string };
   model?: string;
   rounds: { output_dir: string };
+  accounts?: string[];  // multi-account fallback list (e.g. ["default", "work2", "personal"])
 }
 
 function loadWorkflowConfig(projectRoot: string, name: string): WorkflowConfig | null {
@@ -310,10 +345,18 @@ function parseWorkflowYaml(content: string, name: string): WorkflowConfig {
     rounds: { output_dir: `.apr/rounds/${name}` },
   };
   let inDocs = false;
+  let inAccounts = false;
+  const accounts: string[] = [];
   for (const raw of content.split("\n")) {
     const line = raw.trimEnd();
     if (!line || line.startsWith("#")) continue;
-    if (/^documents:/.test(line)) { inDocs = true; continue; }
+    if (/^accounts:/.test(line)) { inAccounts = true; inDocs = false; continue; }
+    if (inAccounts) {
+      const item = raw.match(/^\s+-\s+"?(.+?)"?\s*$/);
+      if (item) { accounts.push(item[1]); continue; }
+      if (!/^\s/.test(line)) inAccounts = false;
+    }
+    if (/^documents:/.test(line)) { inDocs = true; inAccounts = false; continue; }
     if (inDocs && /^\s+\w+:/.test(line)) {
       const m = line.match(/^\s+(\w+):\s*"?(.+?)"?\s*$/);
       if (m && ["readme", "spec", "implementation"].includes(m[1]))
@@ -328,6 +371,7 @@ function parseWorkflowYaml(content: string, name: string): WorkflowConfig {
     const ro = line.match(/^\s+output_dir:\s*"?(.+?)"?\s*$/);
     if (ro) cfg.rounds.output_dir = ro[1];
   }
+  if (accounts.length > 0) cfg.accounts = accounts;
   return cfg;
 }
 
@@ -443,7 +487,10 @@ async function findInput(page: Page): Promise<ElementHandle | null> {
 async function typeAndSend(page: Page, el: ElementHandle, text: string): Promise<boolean> {
   await el.click();
   await page.waitForTimeout(300);
-  await el.type(text, { delay: 0, timeout: Math.max(60000, text.length * 3 + 30000) });
+  // Clear existing content, then insert all text at once (no per-character simulation)
+  await page.keyboard.press("Meta+a");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.insertText(text);
   log(`  入力完了: ${text.length} chars`);
   await page.waitForTimeout(1000);
 
@@ -467,28 +514,434 @@ async function checkQuota(page: Page): Promise<boolean> {
   });
 }
 
-async function waitForResponse(page: Page, maxSec: number): Promise<string> {
-  let last = 0, stable = 0;
-  for (let i = 0; i < maxSec; i++) {
-    await page.waitForTimeout(1000);
-    const text: string = await page.evaluate(() => {
-      const main = document.querySelector('[role="main"], .layout-wrapper') as HTMLElement | null;
-      if (!main) return "";
-      const full = main.innerText || "";
-      const m = full.match(/Model\s+\d{1,2}:\d{2}\s*\n([\s\S]*?)(?:thumb_up|thumb_down|$)/);
-      if (m && m[1].trim().length > 50) return m[1].trim();
-      const parts = full.split("more_vert");
-      if (parts.length >= 3) {
-        const c = parts[parts.length - 1].replace(/thumb_up[\s\S]*$/, "").trim();
-        if (c.length > 50) return c;
-      }
-      return full;
-    });
-    if (text.length === last && text.length > 100) { if (++stable >= 5) return text; }
-    else { stable = 0; last = text.length; }
-    if (i % 15 === 0 && i > 0) log(`  ... 待機中 (${i}s, ${text.length} chars)`);
+// Network-observed Gemini response text (populated by page.on("response") listener).
+// AI Studio renders model responses in closed/inaccessible shadow DOM;
+// passively observing API responses avoids intercepting the request flow.
+let _interceptedResponse = "";
+
+// Parse "text" fields from a raw Gemini API JSON payload.
+// Handles both REST API and $rpc/gRPC-web formats from AI Studio.
+function extractTextFromChunk(raw: string): string {
+  const parts: string[] = [];
+
+  // Pattern 1: Standard REST API — "text": "content..."
+  const textMatches = raw.matchAll(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
+  for (const m of textMatches) {
+    try {
+      parts.push(JSON.parse(`"${m[1]}"`));
+    } catch {
+      parts.push(m[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"'));
+    }
   }
-  return "";
+
+  // Pattern 2: gRPC-web / $rpc chunked — look for long strings (>50 chars)
+  // that look like natural language content (not JSON keys or URLs)
+  if (parts.join("").length < 100) {
+    const longStrings = raw.matchAll(/"((?:[^"\\]|\\.){50,})"/g);
+    for (const m of longStrings) {
+      try {
+        const decoded = JSON.parse(`"${m[1]}"`);
+        // Skip URLs, base64, and JSON-like strings
+        if (decoded.startsWith("http") || /^[A-Za-z0-9+/=]{50,}$/.test(decoded)) continue;
+        // Accept strings with spaces (natural language)
+        if ((decoded.match(/\s/g) || []).length > 5) {
+          parts.push(decoded);
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  return parts.join("");
+}
+
+// Install a passive response listener to capture Gemini API responses.
+// Uses page.on("response") instead of page.route() to avoid interfering
+// with streaming requests (route.fetch() on SSE/chunked streams can crash).
+// Must be called before the prompt is sent.
+function installResponseInterceptor(page: Page): void {
+  _interceptedResponse = "";
+
+  page.on("response", async (response) => {
+    try {
+      const url = response.url();
+      const method = response.request().method();
+      // Log all POST responses for debugging
+      if (method === "POST") {
+        log(`🔍 POST response: ${response.status()} ${url.substring(0, 100)}`);
+      }
+      // Match any Gemini API or AI Studio backend endpoint
+      const isGeminiApi =
+        url.includes("streamGenerateContent") ||
+        url.includes("generateContent") ||
+        url.includes("/v1beta/models/") ||
+        url.includes("/v1/models/") ||
+        url.includes("alkalimakersuite") ||
+        url.includes("generativelanguage.googleapis.com") ||
+        url.includes("aiplatform.googleapis.com");
+      if (!isGeminiApi) return;
+
+      // Try text() first, fall back to body() for streaming/binary responses
+      let body = await response.text().catch(() => "");
+      if (body.length < 100) {
+        const buf = await response.body().catch(() => null);
+        if (buf) body = buf.toString("utf-8");
+      }
+      if (body.length < 100) return;
+
+      const extracted = extractTextFromChunk(body);
+      if (extracted.length > 0) {
+        _interceptedResponse += extracted;
+        log(`📡 Gemini レスポンス: +${extracted.length} chars (合計 ${_interceptedResponse.length})`);
+      }
+    } catch { /* ignore errors in listener */ }
+  });
+}
+
+// Extract the last model response text from AI Studio.
+// AI Studio 2026-Q1+: ms-chat-turn elements are at document root level (no shadow DOM).
+// data-turn-role="Model" (capitalized) identifies model response containers inside virtual scroll.
+// Virtual scroll renders content lazily — caller should scroll to bottom before calling this.
+async function extractLastModelResponse(page: Page): Promise<string> {
+  // Step A: Scroll ms-autoscroll-container to ABSOLUTE BOTTOM to trigger Angular CDK rendering.
+  // After generation, the model response is at the bottom. Scrolling to absolute bottom ensures
+  // the END of the last model turn is in the visible viewport, triggering virtual scroll rendering.
+  // scrollIntoViewIfNeeded is insufficient — it only shows the top edge of the model turn.
+  try {
+    await page.evaluate(`(function() {
+      var c = document.querySelector('ms-autoscroll-container');
+      if (c) {
+        c.scrollTop = c.scrollHeight;
+        c.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }
+    })()`);
+    await page.waitForTimeout(1000); // Initial settle
+    log("  ✅ scroll: ms-autoscroll-container → absolute bottom");
+    // Re-scroll every 1s (Angular CDK may need scroll events to trigger re-render)
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(`(function() {
+        var c = document.querySelector('ms-autoscroll-container');
+        if (c) { c.scrollTop = c.scrollHeight; c.dispatchEvent(new Event('scroll', { bubbles: true })); }
+      })()`);
+      await page.waitForTimeout(1000);
+      const rendered = await page.evaluate(`(function() {
+        var containers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+        var max = 0;
+        containers.forEach(function(c) { var l = (c.innerText || c.textContent || '').trim().length; if (l > max) max = l; });
+        return max;
+      })()`).catch(() => 0) as number;
+      log(`  scroll attempt ${i + 1}: turn-content max = ${rendered} chars`);
+      if (rendered > 200) {
+        log("  ✅ virtual scroll: model turn-content rendered");
+        break;
+      }
+    }
+  } catch { /* timeout ok — content may already be rendered or selector changed */ }
+
+  // Step B: Primary — [data-turn-role="Model"] .turn-content (AI Studio 2026-Q1+ DOM)
+  try {
+    const turnContent = page.locator('[data-turn-role="Model"] .turn-content');
+    const count = await turnContent.count().catch(() => 0);
+    if (count > 0) {
+      // Try innerText first (visible text only), fall back to textContent (includes collapsed thoughts)
+      let text = await turnContent.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (text.trim().length < 200) {
+        const tc = await turnContent.last().textContent({ timeout: 5000 }).catch(() => "");
+        if (tc && tc.trim().length > text.trim().length) {
+          text = tc;
+          log(`  turn-content: using textContent (${text.length} chars)`);
+        }
+      }
+      // Detect AI Studio error response (e.g., "An internal error has occurred.")
+      const preview80 = text.trim().substring(0, 80);
+      if (/an internal error has occurred/i.test(text) || /error_outline/i.test(text)) {
+        log(`  ⚠ AI Studio error detected in turn-content: "${preview80}"`);
+        return `[GAPR_AISTUDIO_ERROR: ${text.trim()}]`;
+      }
+      if (text.trim().length > 200) {
+        log(`  turn-content: ${text.length} chars`);
+        return cleanUiChrome(text);
+      }
+      log(`  turn-content: too short (${text.length} chars), preview: "${preview80.replace(/\n/g, "\\n")}"`);
+      log(`  turn-content count: ${count}`);
+    }
+  } catch { /* try next */ }
+
+  // Step C: Direct ms-chat-turn locator (no pierce/ — shadow DOM removed in AI Studio 2026-Q1)
+  const TURN_SELECTORS = [
+    "ms-chat-turn",
+    ".chat-turn",
+    "model-response",
+    ".model-response-text",
+  ];
+
+  for (const sel of TURN_SELECTORS) {
+    try {
+      const locator = page.locator(sel);
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+
+      // Last turn = model response. Try innerText first, fallback to textContent.
+      let lastText = await locator.last().innerText({ timeout: 5000 }).catch(() => "");
+      if (lastText.trim().length < 100) {
+        // innerText can return empty for virtualized/hidden content; textContent is layout-independent
+        const tc = await locator.last().textContent({ timeout: 3000 }).catch(() => "");
+        if (tc && tc.trim().length > lastText.trim().length) {
+          lastText = tc;
+          log(`  ${sel}: using textContent (innerText was too short)`);
+        }
+      }
+      if (lastText.trim().length > 200) {
+        log(`  selector matched: ${sel} — ${lastText.length} chars`);
+        return cleanUiChrome(lastText);
+      }
+      if (lastText.trim().length > 0) {
+        log(`  selector matched: ${sel} — ${lastText.length} chars (short)`);
+        return cleanUiChrome(lastText);
+      }
+    } catch { /* try next */ }
+  }
+
+  // Step D: evaluate-based fallback (handles both old shadow DOM and new flat DOM patterns)
+  const raw = await page.evaluate(`(function() {
+    function getDeepText(node, depth) {
+      if (!node || depth > 80) return '';
+      var result = '';
+      if (node.nodeType === 3) {
+        var t = (node.textContent || '').trim();
+        if (t) result += t + '\\n';
+      }
+      if (node.shadowRoot) {
+        for (var i = 0; i < node.shadowRoot.childNodes.length; i++) {
+          result += getDeepText(node.shadowRoot.childNodes[i], depth + 1);
+        }
+      }
+      for (var j = 0; j < node.childNodes.length; j++) {
+        result += getDeepText(node.childNodes[j], depth + 1);
+      }
+      return result;
+    }
+    // AI Studio 2026-Q1+: data-turn-role uses capitalized "Model"
+    var modelContainers = document.querySelectorAll('[data-turn-role="Model"] .turn-content');
+    if (modelContainers.length > 0) {
+      var lastContent = modelContainers[modelContainers.length - 1];
+      var contentText = getDeepText(lastContent, 0);
+      if (contentText.length > 100) return contentText;
+    }
+    // Legacy: scan ms-chat-turn (covers both lowercase and uppercase data-turn-role)
+    var selectors = ['ms-chat-turn','.chat-turn','[data-turn-role="model"]','model-response','.model-response-text','.response-container'];
+    var turns = [];
+    for (var s = 0; s < selectors.length; s++) {
+      turns = Array.from(document.querySelectorAll(selectors[s]));
+      if (turns.length > 0) break;
+    }
+    if (turns.length === 0) {
+      var mdContainers = document.querySelectorAll('.markdown-content, .response-text, [class*="message-content"], [class*="model-response"]');
+      if (mdContainers.length > 0) return getDeepText(mdContainers[mdContainers.length - 1], 0);
+      return '';
+    }
+    var lastText = getDeepText(turns[turns.length - 1], 0);
+    if (lastText.length < 500 && turns.length >= 2) {
+      var prevText = getDeepText(turns[turns.length - 2], 0);
+      if (prevText.length > 100 && prevText.length < 30000) lastText = prevText + '\\n---\\n' + lastText;
+    }
+    return lastText;
+  })()`).catch(() => "") as string;
+
+  return cleanUiChrome(raw || "");
+}
+
+// Strip known AI Studio UI chrome patterns from extracted text.
+function cleanUiChrome(text: string): string {
+  const UI_CHROME_PATTERNS = [
+    /^more_vert\n/gm,
+    /^Model\n/gm,
+    /^\d{1,2}:\d{2}\n/gm,
+    // Material icon names
+    /^(key_off|widgets|close|add_circle|progress_activity|expand_more|reset_settings|code|stop_circle|content_copy|edit|check|arrow_drop_down|arrow_upward|arrow_downward|thumb_up|thumb_down|share|bookmark|flag|star|search|menu|settings|info|help|warning|error|delete|refresh|mic|stop|Stop)\n/gm,
+    // AI Studio sidebar labels
+    /^(Run settings|Get code|System instructions|No API Key|Temperature|Media resolution|Thinking level|Default|High|Structured outputs|Code execution|Function calling|Grounding with Google Search|Grounding with Google Maps|URL context|Advanced settings|Tools|Safety settings|Source:|Edit|Google Search)\n/gm,
+    // Model selector text
+    /^(Gemini\s+[\d.]+\s+\S+(\s+Preview)?|gemini-[\w.-]+)\n/gm,
+    /^(Our latest|Switch to a paid|Optional tone and style|Use Arrow Up)\b[^\n]*/gm,
+    /^google\n/gm,
+  ];
+  let cleaned = text;
+  for (const pat of UI_CHROME_PATTERNS) {
+    cleaned = cleaned.replace(pat, "");
+  }
+  return cleaned.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Try to read the last model response via the Copy button + clipboard.
+// First ensures the model response turn is scrolled into view (AI Studio uses virtual scroll;
+// model turn copy buttons only appear in DOM when the turn is rendered).
+async function tryReadViaClipboard(page: Page): Promise<string> {
+  try {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  } catch { /* ignore if already granted */ }
+
+  // Scroll the last ms-chat-turn into view so the model turn copy buttons appear in DOM.
+  // Without this, all copy buttons belong to the user's prompt turn (virtual scroll hides model turn).
+  try {
+    await page.locator("ms-chat-turn").last().scrollIntoViewIfNeeded({ timeout: 5000 });
+    await page.waitForTimeout(2000); // Wait for Angular CDK to render the model turn
+    log("  📍 ms-chat-turn scrolled into view for clipboard");
+  } catch { /* ignore */ }
+
+  // Prefer buttons scoped to Model turn. Fall back to all copy buttons if none found.
+  let btns = await page.$$('[data-turn-role="Model"] button[mattooltip="Copy to clipboard"], [data-turn-role="Model"] button[mattooltip*="Copy" i]').catch(() => []);
+  if (btns.length === 0) {
+    btns = await page.$$('button[mattooltip="Copy to clipboard"], button[mattooltip*="Copy" i]').catch(() => []);
+  }
+  if (btns.length === 0) {
+    log("  ⚠ コピーボタンが見つかりません");
+    return "";
+  }
+
+  // Click the LAST copy button (most recent model response)
+  await btns[btns.length - 1].click().catch(() => {});
+  log(`  📋 コピーボタンクリック (${btns.length}個中最後)`);
+  await page.waitForTimeout(800);
+
+  const text = await page.evaluate(`(async function() {
+    try { return await navigator.clipboard.readText(); }
+    catch(e) { return '__clipboard_error__:' + e; }
+  })()`).catch(() => "") as string;
+
+  if (!text || text.startsWith("__clipboard_error__")) {
+    log(`  ⚠ クリップボード読み取り失敗: ${(text ?? "").substring(0, 80)}`);
+    return "";
+  }
+  return text;
+}
+
+async function waitForResponse(page: Page, maxSec: number, baselineTurnCount: number): Promise<string> {
+  // AI Studio renders model responses in shadow DOM — document.body.innerText won't capture them.
+  // Strategy:
+  //   1. Wait for Stop button to appear/disappear (generation lifecycle)
+  //   2. Poll for model response turn to be added to DOM (ms-chat-turns >= 2)
+  //   3. Extract text via shadow DOM traversal
+  //   4. Fallback to clipboard (copy button click)
+  //   5. Last resort: body text
+
+  const stopSel = [
+    'button[aria-label*="Stop" i]',
+    'button:has-text("Stop")',
+  ].join(", ");
+
+  // Step 1: Wait for a turn newer than the pre-send baseline OR Stop button to appear.
+  // AI Studio Flash models complete very fast — Stop button may never appear.
+  // 45s timeout for Stop button is too long: model turn gets derendered by virtual scroll before we extract.
+  // New strategy: poll for EITHER condition with 3s max before moving on.
+  log("  Step1: 生成開始 or モデルターン出現待機...");
+  const step1Start = Date.now();
+  let generationStarted = false;
+  while (Date.now() - step1Start < 3000) {
+    const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
+    if (turnCount > baselineTurnCount) {
+      log(`  ✅ ms-chat-turn x${turnCount} — 新規モデルターン検出`);
+      generationStarted = true;
+      break;
+    }
+    const stopVisible = await page.locator(stopSel).isVisible().catch(() => false);
+    if (stopVisible) {
+      log("  ▶ 生成開始 (Stop ボタン検出)");
+      generationStarted = true;
+      break;
+    }
+    await page.waitForTimeout(300);
+  }
+  if (!generationStarted) {
+    log("  ⚠ 3s以内にStop/ターン未検出 — 生成中と仮定して継続");
+  }
+
+  // Step 2: Wait for generation to complete. A new turn can exist while it is still streaming,
+  // so turn count alone is not a completion signal.
+  log("  Step2: 生成完了待機...");
+  const step2Start = Date.now();
+  let stopObserved = false;
+  let previousLength = -1;
+  let stableLengthPolls = 0;
+  while (Date.now() - step2Start < maxSec * 1000) {
+    const turnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
+    const stopVisible = await page.locator(stopSel).isVisible().catch(() => false);
+    if (stopVisible) stopObserved = true;
+    if (stopObserved && !stopVisible) {
+      log("  ✅ 生成完了 (Stop 消滅)");
+      break;
+    }
+    if (!stopObserved && turnCount > baselineTurnCount) {
+      const responseLength = await page.locator("ms-chat-turn").last().evaluate((node) => node.textContent?.length ?? 0).catch(() => 0);
+      stableLengthPolls = responseLength > 0 && responseLength === previousLength ? stableLengthPolls + 1 : 0;
+      previousLength = responseLength;
+      if (stableLengthPolls >= 2) {
+        log(`  ✅ 新規モデルターン安定 (${responseLength} chars)`);
+        break;
+      }
+    }
+    await page.waitForTimeout(1000);
+  }
+  await page.waitForTimeout(800); // Short settle for DOM to finish rendering
+
+  // CRITICAL: AI Studio only fully renders virtual-scroll content AFTER saving the chat.
+  // The URL changes from /prompts/new_chat → /prompts/<ID> when saved.
+  // new_chat pages have ms-text-chunk content NOT rendered; saved prompt pages DO render.
+  // Strategy: wait up to 30s for URL change, then extract from the saved page.
+  log("  URL変化待機 (new_chat → /prompts/ID)...");
+  const initialUrl = page.url();
+  const urlWaitStart = Date.now();
+  while (Date.now() - urlWaitStart < 30000) {
+    const curUrl = page.url();
+    if (!curUrl.includes("new_chat") && curUrl.includes("/prompts/")) {
+      log(`  ✅ URL変化確認: ${curUrl.substring(curUrl.lastIndexOf("/") + 1)}`);
+      await page.waitForTimeout(1500); // Extra wait for virtual scroll to render after URL change
+      break;
+    }
+    await page.waitForTimeout(1000);
+  }
+  if (page.url().includes("new_chat")) {
+    log(`  ⚠ URL変化なし (new_chat のまま) — スクロール抽出を試みます`);
+  }
+
+  // Step 4: Primary — shadow DOM traversal
+  const shadowText = await extractLastModelResponse(page);
+  log(`  Shadow DOM: ${shadowText.length} chars`);
+  // Propagate AI Studio error marker immediately — don't fall through to clipboard
+  if (shadowText.startsWith("[GAPR_AISTUDIO_ERROR")) {
+    log(`  ❌ AI Studio error — returning error marker`);
+    return shadowText;
+  }
+  if (shadowText.length > 200) {
+    return shadowText;
+  }
+
+  // Step 4: Secondary — clipboard via Copy button
+  const clipText = await tryReadViaClipboard(page);
+  log(`  Clipboard: ${clipText.length} chars`);
+  if (clipText.length > 100) {
+    return clipText;
+  }
+
+  // Step 5: API-intercepted gRPC text (usually empty for AI Studio)
+  if (_interceptedResponse.length > 100) {
+    log(`  API intercepted: ${_interceptedResponse.length} chars`);
+    return _interceptedResponse;
+  }
+
+  // Step 6: Last resort — body text with aggressive UI chrome cleanup.
+  // Previous versions returned raw body.innerText which captured settings panels,
+  // sidebar labels, and other UI chrome instead of the actual model response.
+  log("  ⚠ フォールバック: body.innerText (UI chrome フィルタ適用)");
+  const bodyText = await page.evaluate(() => document.body.innerText).catch(() => "");
+  const cleaned = cleanUiChrome(bodyText);
+
+  // If cleaned text is <200 chars, it's almost certainly just residual UI chrome — not a real response.
+  // Return an explicit error marker so callers know extraction failed.
+  if (cleaned.length < 200) {
+    log(`  ❌ body.innerText after cleanup: ${cleaned.length} chars — extraction failed`);
+    return `[GAPR_EXTRACTION_FAILED] Shadow DOM, clipboard, API interception, and body.innerText all failed to capture the model response. The page may have changed structure. Raw body length: ${bodyText.length}, cleaned: ${cleaned.length}`;
+  }
+  return cleaned;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,22 +967,22 @@ function nextRound(dir: string, explicit?: number): number {
 async function cmdDaemon(): Promise<void> {
   if (await isDaemonRunning()) {
     logAlways("✅ daemon は既に起動中です");
-    logAlways(`   endpoint: ${fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim()}`);
+    logAlways(`   endpoint: ${fs.readFileSync(_cdpEndpointFile, "utf-8").trim()}`);
     return;
   }
 
-  logAlways(`🚀 [daemon] Chrome 起動中 (CDP port=${CDP_PORT})...`);
-  const lock = path.join(USER_DATA_DIR, "SingletonLock");
+  logAlways(`🚀 [daemon] Chrome 起動中 (CDP port=${_cdpPort})...`);
+  const lock = path.join(_userDataDir, "SingletonLock");
   if (fs.existsSync(lock)) fs.unlinkSync(lock);
 
-  const ctx = await chromium.launchPersistentContext(USER_DATA_DIR, {
+  const ctx = await chromium.launchPersistentContext(_userDataDir, {
     headless: false,
     channel: "chrome",
     args: [
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-blink-features=AutomationControlled",
-      `--remote-debugging-port=${CDP_PORT}`,
+      `--remote-debugging-port=${_cdpPort}`,
     ],
     viewport: { width: 1400, height: 900 },
     timeout: 30000,
@@ -540,7 +993,7 @@ async function cmdDaemon(): Promise<void> {
 
   let wsUrl = "";
   for (let i = 0; i < 10; i++) {
-    try { wsUrl = await fetchWsEndpoint(CDP_PORT); break; }
+    try { wsUrl = await fetchWsEndpoint(_cdpPort); break; }
     catch { await new Promise((r) => setTimeout(r, 500)); }
   }
 
@@ -549,12 +1002,12 @@ async function cmdDaemon(): Promise<void> {
     await ctx.close(); process.exit(1);
   }
 
-  fs.writeFileSync(CDP_ENDPOINT_FILE, wsUrl);
-  fs.writeFileSync(DAEMON_PID_FILE, String(process.pid));
+  fs.writeFileSync(_cdpEndpointFile, wsUrl);
+  fs.writeFileSync(_daemonPidFile, String(process.pid));
   logAlways(`✅ [daemon] 起動完了`);
   logAlways(`   WS: ${wsUrl}`);
   logAlways(`   PID: ${process.pid}`);
-  logAlways(`   プロファイル: ${USER_DATA_DIR}`);
+  logAlways(`   プロファイル: ${_userDataDir}`);
   logAlways(`\n   Google AI Studio でログインしてください（初回のみ）`);
   logAlways(`   停止: gapr stop\n`);
 
@@ -568,8 +1021,8 @@ async function cmdDaemon(): Promise<void> {
   // 終了シグナル
   const cleanup = async () => {
     logAlways("\n🛑 [daemon] 停止中...");
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
     await ctx.close();
     process.exit(0);
   };
@@ -584,8 +1037,8 @@ async function cmdStatus(): Promise<void> {
   const running = await isDaemonRunning();
   logAlways(running ? "✅ daemon: 起動中" : "❌ daemon: 停止中");
   if (running) {
-    logAlways(`   endpoint: ${fs.readFileSync(CDP_ENDPOINT_FILE, "utf-8").trim()}`);
-    const pid = fs.existsSync(DAEMON_PID_FILE) ? fs.readFileSync(DAEMON_PID_FILE, "utf-8").trim() : "不明";
+    logAlways(`   endpoint: ${fs.readFileSync(_cdpEndpointFile, "utf-8").trim()}`);
+    const pid = fs.existsSync(_daemonPidFile) ? fs.readFileSync(_daemonPidFile, "utf-8").trim() : "不明";
     logAlways(`   PID: ${pid}`);
     // タブ一覧
     try {
@@ -599,15 +1052,15 @@ async function cmdStatus(): Promise<void> {
 }
 
 async function cmdStop(): Promise<void> {
-  if (!fs.existsSync(DAEMON_PID_FILE)) { logAlways("daemon は起動していません"); return; }
-  const pid = parseInt(fs.readFileSync(DAEMON_PID_FILE, "utf-8").trim());
+  if (!fs.existsSync(_daemonPidFile)) { logAlways("daemon は起動していません"); return; }
+  const pid = parseInt(fs.readFileSync(_daemonPidFile, "utf-8").trim());
   try {
     process.kill(pid, "SIGTERM");
     logAlways(`🛑 daemon (PID=${pid}) に停止シグナルを送りました`);
   } catch {
     logAlways("daemon プロセスが見つかりません（既に停止済み？）");
-    fs.rmSync(CDP_ENDPOINT_FILE, { force: true });
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(_cdpEndpointFile, { force: true });
+    fs.rmSync(_daemonPidFile, { force: true });
   }
 }
 
@@ -647,61 +1100,162 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
   fs.writeFileSync(path.join(roundPath, "prompt.md"), prompt);
   log(`📂 Round ${roundNum} → ${roundPath}/`);
 
-  // daemon に接続（なければ自動起動）
-  await ensureDaemon();
-  const ctx = await connectToDaemon();
+  // "auto-pro": let AI Studio pick its own latest default (no ?model= param)
+  const newChatUrl = (model === "auto-pro")
+    ? "https://aistudio.google.com/prompts/new_chat"
+    : `https://aistudio.google.com/prompts/new_chat?model=${model}`;
 
-  // タブ取得（URL で識別）
-  const page = await getOrCreateTab(ctx, session?.url ?? null);
-  const newChatUrl = `https://aistudio.google.com/prompts/new_chat?model=${model}`;
+  // Multi-account fallback: try each account in order until quota not exceeded
+  const accountsList = cfg.accounts?.length ? cfg.accounts : ["default"];
+  let accountIdx = 0;
+  if (args.account) {
+    const found = accountsList.indexOf(args.account);
+    if (found >= 0) accountIdx = found;
+  }
 
-  try {
-    if (!session || page.url() === "about:blank" || page.url() === "") {
-      log(`🔗 ${newChatUrl} を開いています...`);
-      await page.goto(newChatUrl, { waitUntil: "networkidle", timeout: 60000 });
-      await page.waitForTimeout(3000);
-    } else {
-      await page.bringToFront();
-      log(`🔗 既存タブをフォアグラウンドに: ${page.url()}`);
-      await page.waitForTimeout(1000);
-    }
+  let ctx!: Awaited<ReturnType<typeof connectToDaemon>>;
+  let page!: import("playwright").Page;
+  let sentResult = false; // hoisted out of while so response capture can use it after break
+  let pageBaselineTurnCount = 0;
 
-    // ログイン確認
-    const inputEl = await findInput(page);
-    if (!inputEl) {
-      const needsLogin = await page.$('a[href*="accounts.google.com"], button:has-text("Sign in")');
-      if (needsLogin) {
-        logAlways("🔐 Google ログインが必要です。ブラウザでログインしてください。");
-        logAlways("   ログイン後、再度 'gapr run' を実行してください。");
-        return;
+  while (accountIdx < accountsList.length) {
+    const acctName = accountsList[accountIdx];
+    resolveAccount(acctName, accountIdx);
+    if (accountIdx > 0) logAlways(`🔄 アカウント[${acctName}]で再試行 (${accountIdx + 1}/${accountsList.length})`);
+
+    // daemon に接続（なければ自動起動）
+    await ensureDaemon();
+    ctx = await connectToDaemon();
+
+    // タブ取得（2番目以降は常に新規タブ）
+    page = await getOrCreateTab(ctx, accountIdx === 0 ? (session?.url ?? null) : null);
+
+    try {
+      if (!session || accountIdx > 0 || page.url() === "about:blank" || page.url() === "") {
+        log(`🔗 ${newChatUrl} を開いています...`);
+        await page.goto(newChatUrl, { waitUntil: "networkidle", timeout: 60000 });
+        await page.waitForTimeout(3000);
+
+        // Auto-dismiss cookie consent banner if present
+        try {
+          const consentBtn = await page.$('button:has-text("同意する"), button:has-text("Accept"), button:has-text("I agree"), button[aria-label="Accept"]');
+          if (consentBtn) {
+            await consentBtn.click();
+            log("🍪 Cookie consent を自動で承認しました");
+            await page.waitForTimeout(1000);
+          }
+        } catch { /* consent not present */ }
+      } else {
+        await page.bringToFront();
+        log(`🔗 既存タブをフォアグラウンドに: ${page.url()}`);
+        await page.waitForTimeout(1000);
       }
-      await page.screenshot({ path: path.join(roundPath, "debug-no-input.png"), fullPage: true });
-      logAlways("❌ 入力欄が見つかりません（debug-no-input.png を確認）");
+
+      // Auto-enable Grounding with Google Search + URL context
+      try {
+        // Open "Run settings" panel if not already open
+        const runSettingsBtn = await page.$('button:has-text("Run settings"), [aria-label="Run settings"]');
+        if (runSettingsBtn) {
+          await runSettingsBtn.click();
+          await page.waitForTimeout(1000);
+        }
+        // Enable "Grounding with Google Search" toggle if OFF
+        const groundingToggle = await page.$('text="Grounding with Google Search"');
+        if (groundingToggle) {
+          const toggleParent = await groundingToggle.evaluateHandle(el => el.closest('[role="switch"], label, .toggle-container') || el.parentElement);
+          const isChecked = await toggleParent.evaluate(el => {
+            if (!el) return false;
+            const toggle = el.querySelector('[role="switch"], input[type="checkbox"]');
+            return toggle ? (toggle as HTMLInputElement).checked || toggle.getAttribute('aria-checked') === 'true' : false;
+          });
+          if (!isChecked) {
+            await groundingToggle.click();
+            log("🔍 Grounding with Google Search を ON にしました");
+            await page.waitForTimeout(500);
+          }
+        }
+        // Enable "URL context" toggle if OFF
+        const urlContextToggle = await page.$('text="URL context"');
+        if (urlContextToggle) {
+          const toggleParent2 = await urlContextToggle.evaluateHandle(el => el.closest('[role="switch"], label, .toggle-container') || el.parentElement);
+          const isChecked2 = await toggleParent2.evaluate(el => {
+            if (!el) return false;
+            const toggle = el.querySelector('[role="switch"], input[type="checkbox"]');
+            return toggle ? (toggle as HTMLInputElement).checked || toggle.getAttribute('aria-checked') === 'true' : false;
+          });
+          if (!isChecked2) {
+            await urlContextToggle.click();
+            log("🔗 URL context を ON にしました");
+            await page.waitForTimeout(500);
+          }
+        }
+        // Close settings panel (press Escape or click elsewhere)
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(500);
+      } catch (e) {
+        log(`⚠ Grounding 自動有効化スキップ: ${e}`);
+      }
+
+      // ログイン確認
+      const inputEl = await findInput(page);
+      if (!inputEl) {
+        const needsLogin = await page.$('a[href*="accounts.google.com"], button:has-text("Sign in")');
+        if (needsLogin) {
+          logAlways(`🔐 [${acctName}] Google ログインが必要です。ブラウザでログインしてください。`);
+          logAlways("   ログイン後、再度 'gapr run' を実行してください。");
+          return;
+        }
+        await page.screenshot({ path: path.join(roundPath, "debug-no-input.png"), fullPage: true });
+        logAlways("❌ 入力欄が見つかりません（debug-no-input.png を確認）");
+        process.exit(1);
+      }
+
+      // Install passive response listener BEFORE sending the prompt to capture Gemini API responses.
+      // Uses page.on("response") — non-intercepting, won't crash on streaming responses.
+      installResponseInterceptor(page);
+
+      const baselineTurnCount = await page.locator("ms-chat-turn").count().catch(() => 0);
+      log(`📋 プロンプト入力中... (既存ターン: ${baselineTurnCount})`);
+      sentResult = await typeAndSend(page, inputEl, prompt);
+      if (!sentResult) {
+        log("⚠️  送信不明");
+        await page.screenshot({ path: path.join(roundPath, "debug-send.png") });
+      } else {
+        log("✅ 送信完了");
+      }
+
+      // Quota チェック
+      await page.waitForTimeout(3000);
+      if (await checkQuota(page)) {
+        logAlways(`❌ [${acctName}] クォータ超過`);
+        await page.screenshot({ path: path.join(roundPath, `quota-error-${acctName}.png`) });
+        accountIdx++;
+        if (accountIdx < accountsList.length) {
+          logAlways(`🔄 次のアカウント [${accountsList[accountIdx]}] に切替...`);
+          await ctx.browser()?.close();
+          continue;
+        }
+        logAlways("❌ 全アカウントのクォータ超過。後で再試行してください。");
+        process.exit(10);
+      }
+      pageBaselineTurnCount = baselineTurnCount;
+      break; // quota OK → proceed (response capture runs after while loop)
+
+    } catch (err) {
+      logAlways("❌ エラー:", err);
+      await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
       process.exit(1);
     }
+  } // end while (multi-account loop)
 
-    log("📋 プロンプト入力中...");
-    const sent = await typeAndSend(page, inputEl, prompt);
-    if (!sent) {
-      log("⚠️  送信不明");
-      await page.screenshot({ path: path.join(roundPath, "debug-send.png") });
-    } else {
-      log("✅ 送信完了");
-    }
-
-    // Quota チェック
-    await page.waitForTimeout(3000);
-    if (await checkQuota(page)) {
-      logAlways("❌ クォータ超過！30分後に再試行してください");
-      await page.screenshot({ path: path.join(roundPath, "quota-error.png") });
-      process.exit(10);
-    }
-
+  // Response capture runs here — AFTER the while loop exits via break (quota OK).
+  // Previously this code was dead (inside the try block before the break).
+  try {
     // セッションURL保存（new_chat → /prompts/<id> に変わるタイミング）
     await page.waitForTimeout(5000);
     const curUrl = page.url();
     if (curUrl.includes("/prompts/") && !curUrl.includes("new_chat")) {
-      saveSession(projectRoot, args.workflow, model, curUrl, roundNum);
+      saveSession(projectRoot, cfg.name ?? args.workflow, model, curUrl, roundNum);
       log(`💾 セッションURL保存: ${curUrl}`);
       fs.writeFileSync(path.join(roundPath, "session-url.txt"), curUrl);
     }
@@ -709,25 +1263,36 @@ async function cmdRun(args: CliArgs, projectRoot: string): Promise<void> {
     await page.screenshot({ path: path.join(roundPath, "post-send.png"), fullPage: true });
 
     log("⏳ Gemini レスポンス待機中...");
-    const response = await waitForResponse(page, sent ? 300 : 30);
+    const response = await waitForResponse(page, sentResult ? 300 : 30, pageBaselineTurnCount);
 
-    if (response.length > 100) {
+    const isExtractionFailure = response.startsWith("[GAPR_EXTRACTION_FAILED]");
+    const isAiStudioError = response.startsWith("[GAPR_AISTUDIO_ERROR");
+    if (!isExtractionFailure && !isAiStudioError && response.length > 500) {
       log(`✅ レスポンス: ${response.length} chars`);
       fs.writeFileSync(path.join(roundPath, "response.md"), response);
     } else {
-      log("⚠️  レスポンス短すぎ → ページ全文保存");
-      const full = await page.evaluate(() => document.body.innerText);
-      fs.writeFileSync(path.join(roundPath, "response-partial.md"), full);
+      if (isAiStudioError) {
+        log(`❌ AI Studio エラー — response.md を上書きしません`);
+        fs.writeFileSync(path.join(roundPath, "error.txt"), response);
+      }
+      log(`⚠️  レスポンス不十分 (${response.length} chars, extraction_failed=${isExtractionFailure}, aistudio_error=${isAiStudioError}) → 診断情報保存`);
+      const full = await page.evaluate(() => document.body.innerText).catch(() => "");
+      const cleaned = cleanUiChrome(full);
+      // Save both raw (for debugging) and cleaned (for possible use)
+      fs.writeFileSync(path.join(roundPath, "response-partial.md"),
+        `<!-- GAPR: extraction incomplete. Cleaned body text below. Raw body: ${full.length} chars -->\n\n${cleaned}`);
+      fs.writeFileSync(path.join(roundPath, "response-debug.txt"),
+        `--- GAPR Extraction Debug ---\nwaitForResponse returned: ${response.length} chars\nisExtractionFailure: ${isExtractionFailure}\nRaw body.innerText: ${full.length} chars\nCleaned: ${cleaned.length} chars\n\n--- Raw Response ---\n${response}\n\n--- Cleaned Body ---\n${cleaned}`);
     }
 
     await page.screenshot({ path: path.join(roundPath, "screenshot.png"), fullPage: true });
     logAlways(`\n🎉 Round ${roundNum} 完了 → ${roundPath}/`);
-
   } catch (err) {
-    logAlways("❌ エラー:", err);
+    logAlways("❌ レスポンスキャプチャエラー:", err);
     await page.screenshot({ path: path.join(roundPath, "error.png") }).catch(() => {});
     process.exit(1);
   }
+
   // タブは残す（daemon が管理）。CDP接続のみ閉じる。
   await ctx.browser()?.close();
 }
@@ -864,8 +1429,8 @@ API key 不要。Google AI Studio をブラウザで自動操作。
 
 ━━ 環境変数 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  CHROME_USER_DATA_DIR    ブラウザプロファイル（デフォルト: ~/.gapr-playwright-profile）
-  GAPR_CDP_PORT           CDP ポート番号（デフォルト: 9322）
+  CHROME__userDataDir    ブラウザプロファイル（デフォルト: ~/.gapr-playwright-profile）
+  GAPR__cdpPort           CDP ポート番号（デフォルト: 9322）
   GAPR_CDP_FILE           endpoint ファイルパス（デフォルト: /tmp/gapr-cdp-endpoint.txt）
 `);
 }
