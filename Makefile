@@ -55,6 +55,15 @@ checksums:
 		echo "Run 'make update-checksums' to fix."; \
 		exit 1; \
 	fi
+	@lib_hash=$$(sha256sum lib/oracle-concurrency.sh | awk '{print $$1}'); \
+	stored_hash=$$(cat lib/oracle-concurrency.sh.sha256 2>/dev/null | awk '{print $$1}' | tr -d '[:space:]'); \
+	if [ "$$lib_hash" != "$$stored_hash" ]; then \
+		echo "ERROR: lib/oracle-concurrency.sh.sha256 is out of date!"; \
+		echo "  Current: $$lib_hash"; \
+		echo "  Stored:  $$stored_hash"; \
+		echo "Run 'make update-checksums' to fix."; \
+		exit 1; \
+	fi
 	@echo "Checksums OK!"
 
 # Update all checksum files
@@ -64,8 +73,9 @@ update-checksums:
 	@sha256sum install.sh | awk '{print $$1}' > install.sh.sha256
 	@sha256sum gapr | awk '{print $$1}' > gapr.sha256
 	@sha256sum gemini-helper.sh | awk '{print $$1}' > gemini-helper.sh.sha256
-	@sha256sum apr install.sh gapr gemini-helper.sh > checksums.txt
-	@sha256sum apr install.sh gapr gemini-helper.sh > CHECKSUMS.sha256
+	@sha256sum lib/oracle-concurrency.sh | awk '{print $$1}' > lib/oracle-concurrency.sh.sha256
+	@sha256sum apr install.sh gapr gemini-helper.sh lib/oracle-concurrency.sh > checksums.txt
+	@sha256sum apr install.sh gapr gemini-helper.sh lib/oracle-concurrency.sh > CHECKSUMS.sha256
 	@echo "Updated checksums:"
 	@echo "  apr:        $$(cat apr.sha256)"
 	@echo "  install.sh: $$(cat install.sh.sha256)"

@@ -50,6 +50,19 @@ jobs:
             failed=true
           fi
 
+          # Shared libraries are sourced in-process, and install.sh verifies
+          # them against lib/<name>.sha256, so those files must stay published
+          # and current.
+          lib_actual=$(sha256sum lib/oracle-concurrency.sh | awk '{print $1}')
+          lib_stored=$(cat lib/oracle-concurrency.sh.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "MISSING")
+          echo "lib/oracle-concurrency.sh:"
+          echo "  actual: $lib_actual"
+          echo "  stored: $lib_stored"
+          if [[ "$lib_actual" != "$lib_stored" ]]; then
+            echo "::error file=lib/oracle-concurrency.sh.sha256::Checksum mismatch! Run 'make update-checksums' to fix."
+            failed=true
+          fi
+
           if $failed; then
             echo ""
             echo "::error::CHECKSUM MISMATCH DETECTED! The installer will fail for users."
