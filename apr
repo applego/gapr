@@ -587,6 +587,43 @@ cmd_update() {
         exit $EXIT_UPDATE_ERROR
     fi
 
+    # Ship the shared libraries this version requires BEFORE swapping the
+    # binary: the new apr exits 3 without lib/oracle-concurrency.sh, so an
+    # update that only replaces `apr` would leave the install unusable.
+    local update_lib_dir
+    update_lib_dir="$(dirname "$script_path")/lib"
+    local lib_name lib_url
+    for lib_name in "${APR_REQUIRED_LIBS[@]}"; do
+        lib_url="${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/lib/${lib_name}"
+        print_info "Fetching lib/${lib_name}..."
+        if command -v curl &> /dev/null; then
+            curl -fsSL "$lib_url" -o "$tmp_dir/$lib_name" 2>/dev/null || true
+        elif command -v wget &> /dev/null; then
+            wget -q "$lib_url" -O "$tmp_dir/$lib_name" 2>/dev/null || true
+        fi
+        if [[ ! -s "$tmp_dir/$lib_name" ]]; then
+            print_error "Failed to fetch required library lib/${lib_name}"
+            print_error "Aborting update to avoid leaving apr unable to start"
+            rm -rf -- "$tmp_dir"
+            exit $EXIT_UPDATE_ERROR
+        fi
+        # A sourced file executes in-process: refuse anything that does not parse.
+        if ! bash -n "$tmp_dir/$lib_name" 2>/dev/null; then
+            print_error "lib/${lib_name} failed bash syntax check; aborting update"
+            rm -rf -- "$tmp_dir"
+            exit $EXIT_UPDATE_ERROR
+        fi
+        if [[ -w "$(dirname "$script_path")" ]]; then
+            mkdir -p "$update_lib_dir" && mv "$tmp_dir/$lib_name" "$update_lib_dir/$lib_name"
+        elif command -v sudo &> /dev/null; then
+            sudo mkdir -p "$update_lib_dir" && sudo mv "$tmp_dir/$lib_name" "$update_lib_dir/$lib_name"
+        else
+            print_error "Cannot write to $update_lib_dir (try running with sudo)"
+            rm -rf -- "$tmp_dir"
+            exit $EXIT_UPDATE_ERROR
+        fi
+    done
+
     # Install update
     print_info "Installing to $script_path..."
     chmod +x "$tmp_dir/apr"

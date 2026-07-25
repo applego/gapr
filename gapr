@@ -882,6 +882,28 @@ run_with_retry() {
 
         if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
             print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
+
+            # Serve-pool failover: a single-flight daemon can be busy (409) or
+            # gone by the time we retry, so move to the next alive endpoint and
+            # rewrite --remote-host in place. Without this the retry hits the
+            # same dead endpoint (apr does the same in run_oracle_with_retry).
+            if declare -F apr_rotate_oracle_remote >/dev/null \
+               && [[ ${#APR_ORACLE_REMOTE_POOL[@]:-0} -gt 1 ]] \
+               && apr_rotate_oracle_remote; then
+                local next_endpoint rewritten=() prev_arg="" cur_arg
+                next_endpoint=$(apr_current_oracle_remote)
+                for cur_arg in "$@"; do
+                    if [[ "$prev_arg" == "--remote-host" ]]; then
+                        rewritten+=("$next_endpoint")
+                    else
+                        rewritten+=("$cur_arg")
+                    fi
+                    prev_arg="$cur_arg"
+                done
+                set -- ${rewritten[@]+"${rewritten[@]}"}
+                print_info "Failing over to oracle serve endpoint: $next_endpoint"
+            fi
+
             print_info "Retrying in ${backoff}s..."
             sleep "$backoff"
             # Exponential backoff: 10s, 30s, 90s

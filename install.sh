@@ -551,6 +551,26 @@ main() {
                 rm -f "$lib_tmp"
                 exit $EXIT_DOWNLOAD_ERROR
             fi
+            # A library is `source`d, so it executes in-process. Verify before
+            # installing: an HTTP 200 is not evidence the body is our script.
+            if ! bash -n "$lib_tmp" 2>/dev/null; then
+                log_error "lib/${lib_name} failed bash syntax check: $lib_url"
+                rm -f "$lib_tmp"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
+            if [[ -z "${APR_SKIP_VERIFY:-}" ]]; then
+                local lib_checksum=""
+                lib_checksum=$(fetch_url "${lib_url}.sha256" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]') || true
+                if [[ -n "$lib_checksum" ]]; then
+                    if ! verify_checksum "$lib_tmp" "$lib_checksum"; then
+                        rm -f "$lib_tmp"
+                        exit $EXIT_CHECKSUM_ERROR
+                    fi
+                    log_info "lib/${lib_name} checksum verified"
+                else
+                    log_dim "  (lib/${lib_name} checksum not available for verification)"
+                fi
+            fi
             $use_sudo mv "$lib_tmp" "$lib_path"
         fi
         $use_sudo chmod 644 "$lib_path"
