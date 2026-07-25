@@ -542,9 +542,21 @@ main() {
         lib_local="${lib_src_dir:+${lib_src_dir}/${lib_name}}"
         log_step "Installing lib/${lib_name} to ${lib_path}..."
         if [[ -n "$lib_local" && -r "$lib_local" ]]; then
+            # An auto-discovered local file is still executed in-process by
+            # `source`, so it gets the same syntax gate as a downloaded one.
+            if ! bash -n "$lib_local" 2>/dev/null; then
+                log_error "lib/${lib_name} failed bash syntax check: $lib_local"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
             $use_sudo cp "$lib_local" "$lib_path"
         else
-            lib_url="${REPO_URL}/lib/${lib_name}"
+            # Match the version the rest of the install used: with APR_VERSION
+            # set, main-branch libraries could be newer than the pinned script.
+            if [[ -n "${APR_VERSION:-}" ]]; then
+                lib_url="${RELEASES_URL}/download/v${APR_VERSION}/${lib_name}"
+            else
+                lib_url="${REPO_URL}/lib/${lib_name}"
+            fi
             lib_tmp=$(mktemp)
             if ! download_file "$lib_url" "$lib_tmp"; then
                 log_error "Failed to download required library from: $lib_url"

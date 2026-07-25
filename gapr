@@ -696,6 +696,9 @@ preflight_check() {
             print_error "Pre-flight failed: shared Oracle library missing"
             return 1
         fi
+        # Self-heal like apr does: crashed runs leave Chrome instances holding
+        # stale login state, and they accumulate until something reaps them.
+        reap_orphan_oracle_chrome || true
         print_success "Oracle available"
     fi
 
@@ -5559,6 +5562,13 @@ robot_run() {
     # Check Oracle
     if ! check_oracle; then
         robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
+        return $?
+    fi
+    # Same requirement as the interactive path: without the shared library this
+    # run would silently lose serve-pool routing and orphan-Chrome reaping.
+    if ! require_oracle_concurrency_lib 2>/dev/null; then
+        robot_fail "dependency_missing" '{"dependency":"lib/oracle-concurrency.sh"}' \
+            "Reinstall gapr (install.sh ships lib/) or use the Gemini backend"
         return $?
     fi
     oracle_detect_features || true
