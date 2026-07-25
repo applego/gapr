@@ -695,11 +695,22 @@ check_oracle() {
 # that legitimately relocate the script (the test suite copies it to a temp dir)
 # must say so with APR_LIB_DIR.
 apr_resolve_lib_dir() {
-    local candidate
+    local self candidate
     if [[ -n "${APR_LIB_DIR:-}" ]]; then
         printf '%s\n' "$APR_LIB_DIR"
         return 0
     fi
+    # Resolve symlinks: installs commonly expose apr via ~/.local/bin/apr ->
+    # <somewhere>/apr, and lib/ sits next to the real file, not the link.
+    self="${BASH_SOURCE[1]}"
+    self="$(realpath "$self" 2>/dev/null || readlink -f "$self" 2>/dev/null || printf '%s' "$self")"
+    candidate="$(cd "$(dirname "$self")" 2>/dev/null && pwd)/lib"
+    if [[ -r "${candidate}/oracle-concurrency.sh" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    # Fall back to the unresolved location so the error message names the path
+    # the user actually invoked.
     candidate="$(cd "$(dirname "${BASH_SOURCE[1]}")" 2>/dev/null && pwd)/lib"
     printf '%s\n' "$candidate"
     [[ -r "${candidate}/oracle-concurrency.sh" ]]
