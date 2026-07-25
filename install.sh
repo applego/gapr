@@ -35,6 +35,9 @@ readonly REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/
 readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 readonly SCRIPT_NAME="gapr"
 readonly HELPER_NAME="gemini-helper.sh"
+# Shared bash libraries that `apr`/`gapr` source at startup. apr exits 3 if
+# lib/oracle-concurrency.sh is absent, so these are mandatory, not optional.
+readonly LIB_FILES=("oracle-concurrency.sh")
 readonly INSTALLER_VERSION="2.0.0"
 
 # Colors (conditional on TTY and NO_COLOR)
@@ -519,6 +522,25 @@ main() {
     fi
     $use_sudo mv "$helper_tmp" "$helper_path"
     $use_sudo chmod +x "$helper_path"
+
+    # Install shared libraries. `apr` hard-requires lib/oracle-concurrency.sh
+    # (it exits 3 without it), so a missing lib file breaks the install.
+    local lib_dir="${install_dir}/lib"
+    $use_sudo mkdir -p "$lib_dir"
+    local lib_name lib_path lib_url lib_tmp
+    for lib_name in "${LIB_FILES[@]}"; do
+        lib_path="${lib_dir}/${lib_name}"
+        lib_url="${REPO_URL}/lib/${lib_name}"
+        lib_tmp=$(mktemp)
+        log_step "Installing lib/${lib_name} to ${lib_path}..."
+        if ! download_file "$lib_url" "$lib_tmp"; then
+            log_error "Failed to download required library from: $lib_url"
+            rm -f "$lib_tmp"
+            exit $EXIT_DOWNLOAD_ERROR
+        fi
+        $use_sudo mv "$lib_tmp" "$lib_path"
+        $use_sudo chmod 644 "$lib_path"
+    done
 
     # Add to PATH
     add_to_path "$install_dir" "$shell_config"

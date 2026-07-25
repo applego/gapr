@@ -59,6 +59,15 @@ GAPR_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gemini-helper.sh
 source "${GAPR_SCRIPT_DIR}/gemini-helper.sh"
 
+# Oracle concurrency/auth helpers, shared with `apr` (lib/oracle-concurrency.sh).
+# Only exercised when a workflow selects `backend: oracle`, but sourced here so
+# that path is never a silently degraded copy of apr's. Optional: a Gemini-only
+# install may ship without lib/.
+if [[ -r "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh" ]]; then
+    # shellcheck source=lib/oracle-concurrency.sh
+    source "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh"
+fi
+
 # Metrics schema (analytics)
 readonly METRICS_SCHEMA_VERSION="1.0.0"
 
@@ -3248,6 +3257,13 @@ run_round() {
         [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
         [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
         [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
+        # Route through the shared serve pool / profile-clone fallback, exactly
+        # as apr does. Login runs keep the local persistent profile so the
+        # session sticks.
+        if [[ "$manual_login" != "true" ]] && declare -F build_oracle_concurrency_args >/dev/null; then
+            build_oracle_concurrency_args
+            oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
+        fi
         oracle_args+=(-p "$prompt")
 
         verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
