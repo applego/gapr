@@ -696,6 +696,11 @@ preflight_check() {
             print_error "Pre-flight failed: shared Oracle library missing"
             return 1
         fi
+        # Keep Oracle current on this path too (apr policy: always latest).
+        # The version was probed by check_oracle's caller; pass what we have.
+        local _oracle_ver=""
+        _oracle_ver=$("${ORACLE_CMD[@]}" --version 2>/dev/null | head -1) || true
+        maybe_autoupdate_oracle "$_oracle_ver" || true
         # Self-heal like apr does: crashed runs leave Chrome instances holding
         # stale login state, and they accumulate until something reaps them.
         reap_orphan_oracle_chrome || true
@@ -3309,6 +3314,11 @@ run_round() {
         [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
         [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
         [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
+        # --no-preflight skips the preflight gate, so enforce the library
+        # requirement here too: this is the last point before an Oracle run.
+        if ! require_oracle_concurrency_lib; then
+            return "$EXIT_DEPENDENCY_ERROR"
+        fi
         # Route through the shared serve pool / profile-clone fallback, exactly
         # as apr does. Login runs keep the local persistent profile so the
         # session sticks.
@@ -5571,6 +5581,9 @@ robot_run() {
             "Reinstall gapr (install.sh ships lib/) or use the Gemini backend"
         return $?
     fi
+    # Repeated robot runs are the main producer of orphaned Chrome instances,
+    # so reap here as well (the interactive preflight already does).
+    reap_orphan_oracle_chrome >/dev/null 2>&1 || true
     oracle_detect_features || true
 
     # Load workflow config
