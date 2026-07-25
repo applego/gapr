@@ -5655,6 +5655,13 @@ robot_run() {
     )
 
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
+    # Robot/detached runs are exactly the automated case that needs serve-pool
+    # routing and the profile-clone fallback, so wire them here too — not only
+    # in the interactive run_round path.
+    if declare -F build_oracle_concurrency_args >/dev/null; then
+        build_oracle_concurrency_args
+        oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
+    fi
 
     verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
     verbose "robot_run output_file: $output_file"
