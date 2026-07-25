@@ -60,13 +60,28 @@ GAPR_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${GAPR_SCRIPT_DIR}/gemini-helper.sh"
 
 # Oracle concurrency/auth helpers, shared with `apr` (lib/oracle-concurrency.sh).
-# Only exercised when a workflow selects `backend: oracle`, but sourced here so
-# that path is never a silently degraded copy of apr's. Optional: a Gemini-only
-# install may ship without lib/.
+# Optional at load time: a Gemini-only install may ship without lib/. But the
+# Oracle backend REQUIRES it (see require_oracle_concurrency_lib), because
+# running that path without the helpers silently loses serve-pool routing,
+# profile-clone fallback, auto-update, and orphan-Chrome reaping.
+GAPR_ORACLE_LIB_LOADED=false
 if [[ -r "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh" ]]; then
     # shellcheck source=lib/oracle-concurrency.sh
     source "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh"
+    GAPR_ORACLE_LIB_LOADED=true
 fi
+
+# Fail loudly instead of degrading silently when a workflow selects the Oracle
+# backend on an install that has no shared library.
+require_oracle_concurrency_lib() {
+    if [[ "$GAPR_ORACLE_LIB_LOADED" == "true" ]] \
+       && declare -F build_oracle_concurrency_args >/dev/null; then
+        return 0
+    fi
+    print_error "backend: oracle requires ${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh"
+    print_error "Reinstall gapr (install.sh ships lib/) or use the Gemini backend."
+    return "$EXIT_DEPENDENCY_ERROR"
+}
 
 # Metrics schema (analytics)
 readonly METRICS_SCHEMA_VERSION="1.0.0"
@@ -674,6 +689,11 @@ preflight_check() {
         # Legacy Oracle backend
         if ! check_oracle; then
             print_error "Pre-flight failed: Oracle not available"
+            return 1
+        fi
+        # The shared concurrency library is mandatory on this path.
+        if ! require_oracle_concurrency_lib; then
+            print_error "Pre-flight failed: shared Oracle library missing"
             return 1
         fi
         print_success "Oracle available"

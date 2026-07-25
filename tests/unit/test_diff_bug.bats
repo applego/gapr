@@ -33,6 +33,9 @@ teardown() {
 #!/bin/bash
 set -e
 # Source APR functions
+# The copy lives outside the repo, so apr's BASH_SOURCE-based library lookup
+# would miss lib/. The last argument carries the real repo lib directory.
+export APR_LIB_DIR="${!#}"
 funcs_file="$(dirname "$0")/apr_funcs.bash"
 sed '/^main "\$@"$/d' "$1" > "$funcs_file"
 source "$funcs_file"
@@ -49,7 +52,7 @@ EOF
     # Run with custom PATH
     (
         export PATH="$TEST_DIR/bin:$PATH"
-        run "$TEST_DIR/run_diff.sh" "$APR_SCRIPT" "$CONFIG_DIR" "3" "5"
+        run "$TEST_DIR/run_diff.sh" "$APR_SCRIPT" "$CONFIG_DIR" "3" "5" "$PROJECT_ROOT/lib"
         
         echo "$output"
         assert_success
@@ -71,6 +74,9 @@ EOF
     cat > "$TEST_DIR/run_diff_single.sh" << 'EOF'
 #!/bin/bash
 set -e
+# The copy lives outside the repo, so apr's BASH_SOURCE-based library lookup
+# would miss lib/. The last argument carries the real repo lib directory.
+export APR_LIB_DIR="${!#}"
 funcs_file="$(dirname "$0")/apr_funcs.bash"
 sed '/^main "\$@"$/d' "$1" > "$funcs_file"
 source "$funcs_file"
@@ -84,7 +90,7 @@ EOF
 
     (
         export PATH="$TEST_DIR/bin:$PATH"
-        run "$TEST_DIR/run_diff_single.sh" "$APR_SCRIPT" "$CONFIG_DIR" "5"
+        run "$TEST_DIR/run_diff_single.sh" "$APR_SCRIPT" "$CONFIG_DIR" "5" "$PROJECT_ROOT/lib"
         
         echo "$output"
         assert_success

@@ -687,10 +687,13 @@ check_oracle() {
 # -----------------------------------------------------------------------------
 # Implementation lives in lib/oracle-concurrency.sh so `gapr` (Oracle backend)
 # gets the identical behaviour instead of a silently degraded copy.
-# Resolution order: explicit APR_LIB_DIR, then the directory holding this file,
-# then the git repo root. The last hop matters when a copy of this script is
-# sourced from elsewhere (tests do exactly that), where BASH_SOURCE points at a
-# temp dir with no lib/.
+# Resolution order: explicit APR_LIB_DIR, then the directory holding this file.
+#
+# Deliberately NOT falling back to `git rev-parse --show-toplevel`: apr is often
+# run from inside an unrelated checkout, and sourcing that repository's
+# lib/oracle-concurrency.sh would execute third-party code in-process. Callers
+# that legitimately relocate the script (the test suite copies it to a temp dir)
+# must say so with APR_LIB_DIR.
 apr_resolve_lib_dir() {
     local candidate
     if [[ -n "${APR_LIB_DIR:-}" ]]; then
@@ -698,17 +701,8 @@ apr_resolve_lib_dir() {
         return 0
     fi
     candidate="$(cd "$(dirname "${BASH_SOURCE[1]}")" 2>/dev/null && pwd)/lib"
-    if [[ -r "${candidate}/oracle-concurrency.sh" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    if candidate="$(git rev-parse --show-toplevel 2>/dev/null)/lib" \
-       && [[ -r "${candidate}/oracle-concurrency.sh" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    printf '%s\n' "$(cd "$(dirname "${BASH_SOURCE[1]}")" 2>/dev/null && pwd)/lib"
-    return 1
+    printf '%s\n' "$candidate"
+    [[ -r "${candidate}/oracle-concurrency.sh" ]]
 }
 
 APR_LIB_DIR="$(apr_resolve_lib_dir)" || true
