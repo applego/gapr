@@ -527,18 +527,32 @@ main() {
     # (it exits 3 without it), so a missing lib file breaks the install.
     local lib_dir="${install_dir}/lib"
     $use_sudo mkdir -p "$lib_dir"
-    local lib_name lib_path lib_url lib_tmp
+    # Prefer a local source tree when one is available: a library added in the
+    # working tree does not exist at the remote URL yet (and CI installs from
+    # the checkout). Resolution order: APR_LOCAL_LIB_DIR, the installer's own
+    # directory (empty for curl-bash pipes), then the remote URL.
+    local lib_src_dir="${APR_LOCAL_LIB_DIR:-}"
+    if [[ -z "$lib_src_dir" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        lib_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+    fi
+
+    local lib_name lib_path lib_url lib_tmp lib_local
     for lib_name in "${LIB_FILES[@]}"; do
         lib_path="${lib_dir}/${lib_name}"
-        lib_url="${REPO_URL}/lib/${lib_name}"
-        lib_tmp=$(mktemp)
+        lib_local="${lib_src_dir:+${lib_src_dir}/${lib_name}}"
         log_step "Installing lib/${lib_name} to ${lib_path}..."
-        if ! download_file "$lib_url" "$lib_tmp"; then
-            log_error "Failed to download required library from: $lib_url"
-            rm -f "$lib_tmp"
-            exit $EXIT_DOWNLOAD_ERROR
+        if [[ -n "$lib_local" && -r "$lib_local" ]]; then
+            $use_sudo cp "$lib_local" "$lib_path"
+        else
+            lib_url="${REPO_URL}/lib/${lib_name}"
+            lib_tmp=$(mktemp)
+            if ! download_file "$lib_url" "$lib_tmp"; then
+                log_error "Failed to download required library from: $lib_url"
+                rm -f "$lib_tmp"
+                exit $EXIT_DOWNLOAD_ERROR
+            fi
+            $use_sudo mv "$lib_tmp" "$lib_path"
         fi
-        $use_sudo mv "$lib_tmp" "$lib_path"
         $use_sudo chmod 644 "$lib_path"
     done
 

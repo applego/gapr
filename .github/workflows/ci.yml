@@ -344,6 +344,9 @@ jobs:
           # The installer normally verifies against main-branch checksums; in CI we install from the
           # checked-out workspace copy, and checksums are validated separately above.
           export APR_SKIP_VERIFY=1
+          # Install libraries from the checkout: a lib added in this branch does
+          # not exist at the main-branch raw URL yet.
+          export APR_LOCAL_LIB_DIR="$(pwd)/lib"
 
           # Create modified installer for testing
           sed \
