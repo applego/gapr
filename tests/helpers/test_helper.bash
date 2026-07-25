@@ -131,6 +131,10 @@ load_apr_functions() {
     # Create a modified version that doesn't call main
     local apr_functions="$TEST_DIR/apr_functions.bash"
 
+    # The copy lives outside the repo, so BASH_SOURCE-based library resolution
+    # would miss lib/. Point APR_LIB_DIR at the real repo lib instead.
+    export APR_LIB_DIR="${PROJECT_ROOT}/lib"
+
     # Extract everything except the final main call
     sed '/^main "\$@"$/d' "$APR_SCRIPT" > "$apr_functions"
 

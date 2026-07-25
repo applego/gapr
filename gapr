@@ -59,6 +59,30 @@ GAPR_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=gemini-helper.sh
 source "${GAPR_SCRIPT_DIR}/gemini-helper.sh"
 
+# Oracle concurrency/auth helpers, shared with `apr` (lib/oracle-concurrency.sh).
+# Optional at load time: a Gemini-only install may ship without lib/. But the
+# Oracle backend REQUIRES it (see require_oracle_concurrency_lib), because
+# running that path without the helpers silently loses serve-pool routing,
+# profile-clone fallback, auto-update, and orphan-Chrome reaping.
+GAPR_ORACLE_LIB_LOADED=false
+if [[ -r "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh" ]]; then
+    # shellcheck source=lib/oracle-concurrency.sh
+    source "${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh"
+    GAPR_ORACLE_LIB_LOADED=true
+fi
+
+# Fail loudly instead of degrading silently when a workflow selects the Oracle
+# backend on an install that has no shared library.
+require_oracle_concurrency_lib() {
+    if [[ "$GAPR_ORACLE_LIB_LOADED" == "true" ]] \
+       && declare -F build_oracle_concurrency_args >/dev/null; then
+        return 0
+    fi
+    print_error "backend: oracle requires ${GAPR_SCRIPT_DIR}/lib/oracle-concurrency.sh"
+    print_error "Reinstall gapr (install.sh ships lib/) or use the Gemini backend."
+    return "$EXIT_DEPENDENCY_ERROR"
+}
+
 # Metrics schema (analytics)
 readonly METRICS_SCHEMA_VERSION="1.0.0"
 
@@ -667,6 +691,19 @@ preflight_check() {
             print_error "Pre-flight failed: Oracle not available"
             return 1
         fi
+        # The shared concurrency library is mandatory on this path.
+        if ! require_oracle_concurrency_lib; then
+            print_error "Pre-flight failed: shared Oracle library missing"
+            return 1
+        fi
+        # Keep Oracle current on this path too (apr policy: always latest).
+        # The version was probed by check_oracle's caller; pass what we have.
+        local _oracle_ver=""
+        _oracle_ver=$("${ORACLE_CMD[@]}" --version 2>/dev/null | head -1) || true
+        maybe_autoupdate_oracle "$_oracle_ver" || true
+        # Self-heal like apr does: crashed runs leave Chrome instances holding
+        # stale login state, and they accumulate until something reaps them.
+        reap_orphan_oracle_chrome || true
         print_success "Oracle available"
     fi
 
@@ -873,6 +910,35 @@ run_with_retry() {
 
         if [[ $attempt -lt $MAX_RETRY_ATTEMPTS ]]; then
             print_warning "Attempt $attempt/$MAX_RETRY_ATTEMPTS failed (exit code: $exit_code)"
+
+            # Serve-pool failover: a single-flight daemon can be busy (409) or
+            # gone by the time we retry, so move to the next alive endpoint and
+            # rewrite --remote-host in place. Without this the retry hits the
+            # same dead endpoint (apr does the same in run_oracle_with_retry).
+            # `${#arr[@]:-0}` is a bad substitution, and the array is only
+            # defined once the shared library is sourced, so count via the
+            # expansion-with-default form instead of indexing the array.
+            local _pool_size=0
+            if declare -F apr_rotate_oracle_remote >/dev/null; then
+                _pool_size=$(printf '%s\n' ${APR_ORACLE_REMOTE_POOL[@]+"${APR_ORACLE_REMOTE_POOL[@]}"} | grep -c . || true)
+            fi
+            if declare -F apr_rotate_oracle_remote >/dev/null \
+               && [[ "$_pool_size" -gt 1 ]] \
+               && apr_rotate_oracle_remote; then
+                local next_endpoint rewritten=() prev_arg="" cur_arg
+                next_endpoint=$(apr_current_oracle_remote)
+                for cur_arg in "$@"; do
+                    if [[ "$prev_arg" == "--remote-host" ]]; then
+                        rewritten+=("$next_endpoint")
+                    else
+                        rewritten+=("$cur_arg")
+                    fi
+                    prev_arg="$cur_arg"
+                done
+                set -- ${rewritten[@]+"${rewritten[@]}"}
+                print_info "Failing over to oracle serve endpoint: $next_endpoint"
+            fi
+
             print_info "Retrying in ${backoff}s..."
             sleep "$backoff"
             # Exponential backoff: 10s, 30s, 90s
@@ -3248,6 +3314,18 @@ run_round() {
         [[ "$manual_login" == "true" ]] && oracle_args+=(--browser-manual-login)
         [[ "$keep_browser" == "true" ]] && oracle_args+=(--browser-keep-browser)
         [[ -n "$thinking_time" ]] && oracle_args+=(--browser-thinking-time "$thinking_time")
+        # --no-preflight skips the preflight gate, so enforce the library
+        # requirement here too: this is the last point before an Oracle run.
+        if ! require_oracle_concurrency_lib; then
+            return "$EXIT_DEPENDENCY_ERROR"
+        fi
+        # Route through the shared serve pool / profile-clone fallback, exactly
+        # as apr does. Login runs keep the local persistent profile so the
+        # session sticks.
+        if [[ "$manual_login" != "true" ]] && declare -F build_oracle_concurrency_args >/dev/null; then
+            build_oracle_concurrency_args
+            oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
+        fi
         oracle_args+=(-p "$prompt")
 
         verbose "Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
@@ -5496,6 +5574,16 @@ robot_run() {
         robot_fail "dependency_missing" '{"dependency":"oracle"}' "Oracle not available"
         return $?
     fi
+    # Same requirement as the interactive path: without the shared library this
+    # run would silently lose serve-pool routing and orphan-Chrome reaping.
+    if ! require_oracle_concurrency_lib 2>/dev/null; then
+        robot_fail "dependency_missing" '{"dependency":"lib/oracle-concurrency.sh"}' \
+            "Reinstall gapr (install.sh ships lib/) or use the Gemini backend"
+        return $?
+    fi
+    # Repeated robot runs are the main producer of orphaned Chrome instances,
+    # so reap here as well (the interactive preflight already does).
+    reap_orphan_oracle_chrome >/dev/null 2>&1 || true
     oracle_detect_features || true
 
     # Load workflow config
@@ -5617,6 +5705,13 @@ robot_run() {
     )
 
     [[ "$ORACLE_SUPPORTS_NOTIFY" == "true" ]] && oracle_args+=(--notify)
+    # Robot/detached runs are exactly the automated case that needs serve-pool
+    # routing and the profile-clone fallback, so wire them here too — not only
+    # in the interactive run_round path.
+    if declare -F build_oracle_concurrency_args >/dev/null; then
+        build_oracle_concurrency_args
+        oracle_args+=( ${APR_ORACLE_EXTRA_ARGS[@]+"${APR_ORACLE_EXTRA_ARGS[@]}"} )
+    fi
 
     verbose "robot_run Oracle command: ${ORACLE_CMD[*]} ${oracle_args[*]}"
     verbose "robot_run output_file: $output_file"

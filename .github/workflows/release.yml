@@ -74,14 +74,17 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           # Combined checksums file (full format: hash  filename)
-          sha256sum apr install.sh > checksums.txt
-          sha256sum apr install.sh > CHECKSUMS.sha256
+          sha256sum apr install.sh lib/oracle-concurrency.sh > checksums.txt
+          sha256sum apr install.sh lib/oracle-concurrency.sh > CHECKSUMS.sha256
           echo "Combined checksums:"
           cat checksums.txt
 
           # Individual checksum files (hash only, for easy verification)
           sha256sum apr | awk '{print $1}' > apr.sha256
           sha256sum install.sh | awk '{print $1}' > install.sh.sha256
+          # apr sources this at startup; ship its checksum so both install.sh
+          # and `apr update` can verify what they fetch.
+          sha256sum lib/oracle-concurrency.sh | awk '{print $1}' > lib/oracle-concurrency.sh.sha256
 
           echo ""
           echo "Individual checksums:"
@@ -168,10 +171,12 @@ jobs:
           files: |
             apr
             install.sh
+            lib/oracle-concurrency.sh
             checksums.txt
             CHECKSUMS.sha256
             apr.sha256
             install.sh.sha256
+            lib/oracle-concurrency.sh.sha256
             VERSION
           draft: false
           prerelease: false

@@ -38,13 +38,20 @@ jobs:
           # Read stored checksums
           stored_apr_hash=$(cat apr.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "")
           stored_install_hash=$(cat install.sh.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "")
+          # Shared libraries are sourced in-process and verified by install.sh
+          # against lib/<name>.sha256, so keep that file in sync here too.
+          lib_hash=$(sha256sum lib/oracle-concurrency.sh | awk '{print $1}')
+          stored_lib_hash=$(cat lib/oracle-concurrency.sh.sha256 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "")
 
           echo "Current apr hash:      $apr_hash"
           echo "Stored apr hash:       $stored_apr_hash"
           echo "Current install hash:  $install_hash"
           echo "Stored install hash:   $stored_install_hash"
 
-          if [[ "$apr_hash" != "$stored_apr_hash" ]] || [[ "$install_hash" != "$stored_install_hash" ]]; then
+          echo "Current lib hash:      $lib_hash"
+          echo "Stored lib hash:       $stored_lib_hash"
+
+          if [[ "$apr_hash" != "$stored_apr_hash" ]] || [[ "$install_hash" != "$stored_install_hash" ]] || [[ "$lib_hash" != "$stored_lib_hash" ]]; then
             echo "needs_update=true" >> $GITHUB_OUTPUT
             echo "::notice::Checksum files need updating"
           else
@@ -60,10 +67,11 @@ jobs:
           # Generate individual checksum files (hash only)
           sha256sum apr | awk '{print $1}' > apr.sha256
           sha256sum install.sh | awk '{print $1}' > install.sh.sha256
+          sha256sum lib/oracle-concurrency.sh | awk '{print $1}' > lib/oracle-concurrency.sh.sha256
 
           # Generate combined checksum files
-          sha256sum apr install.sh > checksums.txt
-          sha256sum apr install.sh > CHECKSUMS.sha256
+          sha256sum apr install.sh lib/oracle-concurrency.sh > checksums.txt
+          sha256sum apr install.sh lib/oracle-concurrency.sh > CHECKSUMS.sha256
 
           echo "Updated checksums:"
           echo "  apr:        $(cat apr.sha256)"
@@ -77,7 +85,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add apr.sha256 install.sh.sha256 checksums.txt CHECKSUMS.sha256
+          git add apr.sha256 install.sh.sha256 lib/oracle-concurrency.sh.sha256 checksums.txt CHECKSUMS.sha256
 
           # Check if there are actually changes to commit
           if git diff --cached --quiet; then

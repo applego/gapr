@@ -25,6 +25,9 @@ set -u
 # Source APR functions (strip main)
 # Write to a temp file in the same dir as this script (TEST_DIR)
 funcs_file="$(dirname "$0")/apr_funcs.bash"
+# The copy lives outside the repo, so BASH_SOURCE-based library resolution
+# would miss lib/. $3 carries the real repo lib directory.
+export APR_LIB_DIR="$3"
 sed '/^main "\$@"$/d' "$1" > "$funcs_file"
 source "$funcs_file"
 
@@ -62,7 +65,7 @@ echo "Success: Lock file preserved"
 EOF
     chmod +x "$TEST_DIR/lock_test.sh"
     
-    run "$TEST_DIR/lock_test.sh" "$APR_SCRIPT" "$CONFIG_DIR"
+    run "$TEST_DIR/lock_test.sh" "$APR_SCRIPT" "$CONFIG_DIR" "$PROJECT_ROOT/lib"
     
     echo "$output"
     

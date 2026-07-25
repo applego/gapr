@@ -228,3 +228,26 @@ EOF
       | apr_orphan_oracle_chrome_pids)
     [[ "$out" == "666" ]]
 }
+
+# =============================================================================
+# Library distribution invariants (regression guards)
+# =============================================================================
+
+@test "apr declares APR_REQUIRED_LIBS so self-update ships the library" {
+    # Without the declaration the update loop silently iterates zero times and
+    # leaves an updated apr unable to start (it exits 3 without the library).
+    grep -q '^readonly APR_REQUIRED_LIBS=(' "$APR_SCRIPT"
+    run bash -c "source <(sed '/^main \"\$@\"\$/d' '$APR_SCRIPT') >/dev/null 2>&1; printf '%s' \"\${APR_REQUIRED_LIBS[*]}\""
+    [[ "$output" == *"oracle-concurrency.sh"* ]]
+}
+
+@test "install.sh declares LIB_FILES so fresh installs ship the library" {
+    grep -q '^readonly LIB_FILES=(' "$PROJECT_ROOT/install.sh"
+}
+
+@test "no bad array-length substitution (\${#arr[@]:-0}) in shipped scripts" {
+    # `${#arr[@]:-0}` is a bash "bad substitution" and aborts at runtime.
+    # Strip comments first: the pattern is legitimately named in a code comment.
+    run bash -c "sed 's/#.*//' '$APR_SCRIPT' '$PROJECT_ROOT/gapr' '$PROJECT_ROOT/lib/oracle-concurrency.sh' | grep -nE '\\\$\\{#[A-Za-z_][A-Za-z0-9_]*\\[@\\]:-'"
+    [[ "$status" -ne 0 ]]
+}

@@ -35,6 +35,9 @@ readonly REPO_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/
 readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 readonly SCRIPT_NAME="gapr"
 readonly HELPER_NAME="gemini-helper.sh"
+# Shared bash libraries that `apr`/`gapr` source at startup. apr exits 3 if
+# lib/oracle-concurrency.sh is absent, so these are mandatory, not optional.
+readonly LIB_FILES=("oracle-concurrency.sh")
 readonly INSTALLER_VERSION="2.0.0"
 
 # Colors (conditional on TTY and NO_COLOR)
@@ -519,6 +522,71 @@ main() {
     fi
     $use_sudo mv "$helper_tmp" "$helper_path"
     $use_sudo chmod +x "$helper_path"
+
+    # Install shared libraries. `apr` hard-requires lib/oracle-concurrency.sh
+    # (it exits 3 without it), so a missing lib file breaks the install.
+    local lib_dir="${install_dir}/lib"
+    $use_sudo mkdir -p "$lib_dir"
+    # Prefer a local source tree when one is available: a library added in the
+    # working tree does not exist at the remote URL yet (and CI installs from
+    # the checkout). Resolution order: APR_LOCAL_LIB_DIR, the installer's own
+    # directory (empty for curl-bash pipes), then the remote URL.
+    local lib_src_dir="${APR_LOCAL_LIB_DIR:-}"
+    if [[ -z "$lib_src_dir" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        lib_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+    fi
+
+    local lib_name lib_path lib_url lib_tmp lib_local
+    for lib_name in "${LIB_FILES[@]}"; do
+        lib_path="${lib_dir}/${lib_name}"
+        lib_local="${lib_src_dir:+${lib_src_dir}/${lib_name}}"
+        log_step "Installing lib/${lib_name} to ${lib_path}..."
+        if [[ -n "$lib_local" && -r "$lib_local" ]]; then
+            # An auto-discovered local file is still executed in-process by
+            # `source`, so it gets the same syntax gate as a downloaded one.
+            if ! bash -n "$lib_local" 2>/dev/null; then
+                log_error "lib/${lib_name} failed bash syntax check: $lib_local"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
+            $use_sudo cp "$lib_local" "$lib_path"
+        else
+            # Match the version the rest of the install used: with APR_VERSION
+            # set, main-branch libraries could be newer than the pinned script.
+            if [[ -n "${APR_VERSION:-}" ]]; then
+                lib_url="${RELEASES_URL}/download/v${APR_VERSION}/${lib_name}"
+            else
+                lib_url="${REPO_URL}/lib/${lib_name}"
+            fi
+            lib_tmp=$(mktemp)
+            if ! download_file "$lib_url" "$lib_tmp"; then
+                log_error "Failed to download required library from: $lib_url"
+                rm -f "$lib_tmp"
+                exit $EXIT_DOWNLOAD_ERROR
+            fi
+            # A library is `source`d, so it executes in-process. Verify before
+            # installing: an HTTP 200 is not evidence the body is our script.
+            if ! bash -n "$lib_tmp" 2>/dev/null; then
+                log_error "lib/${lib_name} failed bash syntax check: $lib_url"
+                rm -f "$lib_tmp"
+                exit $EXIT_CHECKSUM_ERROR
+            fi
+            if [[ -z "${APR_SKIP_VERIFY:-}" ]]; then
+                local lib_checksum=""
+                lib_checksum=$(fetch_url "${lib_url}.sha256" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]') || true
+                if [[ -n "$lib_checksum" ]]; then
+                    if ! verify_checksum "$lib_tmp" "$lib_checksum"; then
+                        rm -f "$lib_tmp"
+                        exit $EXIT_CHECKSUM_ERROR
+                    fi
+                    log_info "lib/${lib_name} checksum verified"
+                else
+                    log_dim "  (lib/${lib_name} checksum not available for verification)"
+                fi
+            fi
+            $use_sudo mv "$lib_tmp" "$lib_path"
+        fi
+        $use_sudo chmod 644 "$lib_path"
+    done
 
     # Add to PATH
     add_to_path "$install_dir" "$shell_config"

@@ -57,6 +57,20 @@ if [[ "$url" == *"gemini-helper.sh.sha256"* ]]; then
     exit 22
 fi
 
+# Shared libraries: serve a minimal sourceable stub (content is irrelevant to
+# the installer contract; presence at the destination is what matters).
+if [[ "$url" == *"/lib/"* ]]; then
+    if [[ "$url" == *.sha256 ]]; then
+        exit 22
+    fi
+    if [[ -n "${out:-}" ]]; then
+        printf '# stub library\n' > "$out"
+    else
+        printf '# stub library\n'
+    fi
+    exit 0
+fi
+
 if [[ -n "${out:-}" ]]; then
     if [[ "$url" == *".sha256"* ]]; then
         cp "$APR_TEST_REMOTE_SHA" "$out"
@@ -108,6 +122,8 @@ EOF
     assert_file_exists "$dest_dir/gapr"
     [[ -x "$dest_dir/gapr" ]]
     assert_file_exists "$dest_dir/gemini-helper.sh"
+    # apr/gapr source this at startup and apr exits 3 without it.
+    assert_file_exists "$dest_dir/lib/oracle-concurrency.sh"
 }
 
 @test "install.sh: verifies checksum when available" {
