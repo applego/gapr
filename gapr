@@ -887,8 +887,15 @@ run_with_retry() {
             # gone by the time we retry, so move to the next alive endpoint and
             # rewrite --remote-host in place. Without this the retry hits the
             # same dead endpoint (apr does the same in run_oracle_with_retry).
+            # `${#arr[@]:-0}` is a bad substitution, and the array is only
+            # defined once the shared library is sourced, so count via the
+            # expansion-with-default form instead of indexing the array.
+            local _pool_size=0
+            if declare -F apr_rotate_oracle_remote >/dev/null; then
+                _pool_size=$(printf '%s\n' ${APR_ORACLE_REMOTE_POOL[@]+"${APR_ORACLE_REMOTE_POOL[@]}"} | grep -c . || true)
+            fi
             if declare -F apr_rotate_oracle_remote >/dev/null \
-               && [[ ${#APR_ORACLE_REMOTE_POOL[@]:-0} -gt 1 ]] \
+               && [[ "$_pool_size" -gt 1 ]] \
                && apr_rotate_oracle_remote; then
                 local next_endpoint rewritten=() prev_arg="" cur_arg
                 next_endpoint=$(apr_current_oracle_remote)

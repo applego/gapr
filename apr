@@ -84,6 +84,9 @@ readonly REPO_OWNER="Dicklesworthstone"
 readonly REPO_NAME="automated_plan_reviser_pro"
 readonly GITHUB_RAW="https://raw.githubusercontent.com"
 readonly VERSION_URL="${GITHUB_RAW}/${REPO_OWNER}/${REPO_NAME}/main/VERSION"
+# Shared libraries this version sources at startup; every install/update path
+# must ship them or apr cannot start (exit 3).
+readonly APR_REQUIRED_LIBS=("oracle-concurrency.sh")
 readonly RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
 
 # -----------------------------------------------------------------------------
